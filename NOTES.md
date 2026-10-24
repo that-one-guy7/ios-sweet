@@ -431,3 +431,16 @@ What it took today (in order): 0058 HID services (Apple IOHIDFamily-1915 user cl
      cpu_init, before arm_vm_init.
   5. panic hook at top of panic_trap_to_debugger: va_copy + _doprnt(fmt, &copy, sweet_early_putc, 16).
   Verify with tools/xnu-cc.py (compile+symbols) and patch-order simulation before the single CI run.
+
+## Mi 8 (dipper, SDM845) handoff - 2026-10-24
+
+- Target: Xiaomi Mi 8, UFS, bootloader unlocked, `fastboot boot` works. Added `shim/board.h` (TARGET_MI8), `shim/mi8.c`
+  (display/log diagnostic), `mi8/` (builder, DTB, host test, README) and workflow `mi8-shim`. Default (sweet) build output
+  is unchanged (console host render byte-identical).
+- Observation (live FDT/dmesg): panel `dsi_ss_ea8074_notch_fhd_cmd` = DSI command mode, TE pin, `mdp-trigger none`,
+  `dma-trigger trigger_sw`. cont_splash `0x9d400000`/36 MB. ramoops `0xb0000000` ecc off. Boot image: v1, DTB appended,
+  DTB #1 matches msm-id 321/0x20001 board-id 55.
+- Guess, unverified: SDE register offsets in `shim/mi8.c` come from memory of the Linux msm-4.9 sde_hw_* sources; ABL
+  accepts a gzip'd shim Image + appended DTB (stock layout) - fallback is the UNCOMPRESSED_IMG container.
+- Not done: no CI run yet, nothing booted on hardware. Next: run `mi8-shim`, `fastboot boot` mi8-diag-gz.img, read the
+  pstore log, decide the per-frame trigger, then port UFS/ADT (`tools/mkadt.py`) for 0x1d84000, GIC and the high RAM bank.
