@@ -45,12 +45,14 @@ QEMU_VTIMER_INTID = 27
 BOARDS = {
     'sweet': dict(FB=0x9c000000, FB_SIZE=0x1700000, FB_H=2400, HIGH_MEM_SIZE=0xfcc00000,
                   ECID=0x5357454554000001, BIG_FIRST=6, CLK_SMALL=1804800000, CLK_BIG=2304000000,
-                  CPU_COMPAT='qcom,kryo470', SOC_COMPAT=('qcom,sm7150',)),
+                  CPU_COMPAT=('qcom,kryo470',), SOC_COMPAT=('qcom,sm7150',)),
     # Mi 8: cpu0-3 Kryo 385 Silver (A55-based), cpu4-7 Gold. ABL splash buffer 0x9d400000 (36 MB region),
     # 1080x2248; upper DDR bank 0x1_00000000..0x1_fd400000 from the live FDT memory node.
     'mi8': dict(FB=0x9d400000, FB_SIZE=0x2400000, FB_H=2248, HIGH_MEM_SIZE=0xfd400000,
                 ECID=0x4d49382d00000001, BIG_FIRST=4, CLK_SMALL=1766400000, CLK_BIG=2803200000,
-                CPU_COMPAT='qcom,kryo385', SOC_COMPAT=('xiaomi,dipper', 'qcom,sdm845')),
+                # The boot-CPU driver (0018) and AppleKeyStore (0038) match IONameMatch 'qcom,kryo470': keep that string first
+                # and add the real name after it, or no CPU driver attaches and boot stalls.
+                CPU_COMPAT=('qcom,kryo470', 'qcom,kryo385'), SOC_COMPAT=('xiaomi,dipper', 'qcom,sdm845')),
 }
 BOARD = BOARDS['sweet']
 
@@ -161,7 +163,7 @@ def build(seed=None, qemu=False, highmem=False):
         cpu_nodes.append(node(f'cpu{core}', [
             ph(),
             ('device_type', cstr('cpu')),
-            ('compatible', cstr(BOARD['CPU_COMPAT']) + cstr('ARM,v8')),
+            ('compatible', b''.join(cstr(c) for c in BOARD['CPU_COMPAT']) + cstr('ARM,v8')),
             ('reg', u32(core << 8)),  # actual MPIDR Aff1:Aff0, NOT logical ID
             ('cpu-id', u32(core)),   # descriptive: XNU assigns IDs by DT order
             ('cluster-id', u32(0)),  # descriptive; see ml_parse_cpu_topology
