@@ -329,7 +329,7 @@ void mi8_diag(uintptr_t dtb)
 	tick_i = nl;
 	pair("PP0C", -1, "cnt=", 0, "n=", 0);
 	flush_log();
-	for (uint32_t round = 0; round < 2; round++) {
+	for (uint32_t round = 0; round < 1; round++) {
 		tick(round * 4 + 0);
 		render(C_BLUE, "cycle BLUE (no display writes)");
 		delay_ms(3000);
@@ -344,6 +344,131 @@ void mi8_diag(uintptr_t dtb)
 		delay_ms(3000);
 	}
 	flush_log();
+}
+
+/* ---- touch discovery (read-mostly) ----
+ * Mi 8 touch: STM FTS at i2c 0x49 on i2c@a98000 (QUPV3_1 SE6), irq GPIO31, reset GPIO32,
+ * avdd = pm8998_l28 3.3 V (RPMh), vdd = disp_vddio_vreg (fixed). Question for this probe: did ABL leave the
+ * rails on and SE6 usable? Everything is a read except one bounded I2C read transaction on SE6. Offsets for the
+ * GCC lines come from memory of the SDM845 clock tree (unverified); the GENI SE registers are the standard ones
+ * sweet's driver uses. */
+#define GCC_BASE	0x00100000UL
+#define GCC_QUP_VOTE	0x5200c
+#define GCC_RCG_W1S6	0x18868
+#define TLMM_BASE	0x03400000UL
+#define SE6_BASE	0x00a98000UL
+#define SE_STATUS	0x040
+#define SE_FW		0x068
+#define SE_RX_LEN	0x270
+#define SE_CMD		0x600
+#define SE_CTRL		0x604
+#define SE_IRQ		0x610
+#define SE_IRQ_CLR	0x618
+#define SE_RX		0x780
+#define SE_TX_COUNT	0x800
+#define SE_RX_COUNT	0x804
+#define SE_HW_TX	0xe24
+#define SE_HW_RX	0xe28
+#define SE_DONE		(1U << 0)
+#define SE_NACK		(1U << 10)
+#define SE_ERRORS	(0x0eU | (1U << 9) | (1U << 10) | (1U << 12) | (1U << 13) | (3U << 24) | (3U << 28))
+
+static void delay_us(unsigned us)
+{
+	uint64_t end = ticks() + tfreq() / 1000000 * us;
+
+	while (ticks() < end)
+		;
+}
+
+/* 0 ok, 1 NACK, 2 bus error, 3 timeout. *last = last IRQ status seen. */
+static int se6_read(uint8_t addr, uint8_t *buf, unsigned nr, uint32_t *last)
+{
+	unsigned got = 0;
+
+	for (unsigned i = 0; i < 5000 && (rd32(SE6_BASE + SE_STATUS) & 1U); i++)
+		delay_us(1);
+	if (rd32(SE6_BASE + SE_STATUS) & 1U)
+		return 3;
+	wr32(SE6_BASE + SE_IRQ_CLR, 0xffffffffU);
+	wr32(SE6_BASE + SE_RX_LEN, nr);
+	wr32(SE6_BASE + SE_CMD, (2U << 27) | ((uint32_t)addr << 9));	/* I2C READ */
+	for (unsigned i = 0; i < 20000; i++) {
+		uint32_t irq = rd32(SE6_BASE + SE_IRQ);
+		uint32_t count = rd32(SE6_BASE + SE_RX_COUNT) & 0x1ffffffU;
+
+		*last = irq;
+		if (irq & SE_ERRORS) {
+			for (unsigned j = 0; j < 5000 && !(irq & SE_DONE); j++) {
+				delay_us(1);
+				irq = rd32(SE6_BASE + SE_IRQ);
+			}
+			wr32(SE6_BASE + SE_IRQ_CLR, irq);
+			return (irq & SE_NACK) ? 1 : 2;
+		}
+		if (count > 64)
+			return 2;
+		while (count--) {
+			uint32_t w = rd32(SE6_BASE + SE_RX);
+
+			for (unsigned j = 0; j < 4 && got < nr; j++)
+				buf[got++] = (uint8_t)(w >> (8U * j));
+		}
+		if (irq & SE_DONE) {
+			wr32(SE6_BASE + SE_IRQ_CLR, irq);
+			return got == nr ? 0 : 2;
+		}
+		delay_us(1);
+	}
+	wr32(SE6_BASE + SE_CTRL, 2);	/* abort, release the bus */
+	delay_us(2000);
+	wr32(SE6_BASE + SE_IRQ_CLR, 0xffffffffU);
+	return 3;
+}
+
+void mi8_touch_probe(void)
+{
+	static const uint32_t tile[3] = { 0x500000, 0x900000, 0x100000 };
+	uint8_t b[4] = { 0, 0, 0, 0 };
+	uint32_t last = 0;
+	int rc;
+
+	nl = 0;
+	tick_i = -1;
+	msg("TOUCH", "mi8 touch discovery (read-only)");
+	pair("GCC", -1, "qupvt=", rd32(GCC_BASE + GCC_QUP_VOTE), 0, 0);
+	pair("RCG", -1, "cmd=", rd32(GCC_BASE + GCC_RCG_W1S6), "cfg=", rd32(GCC_BASE + GCC_RCG_W1S6 + 4));
+	/* pins 31 (irq) and 32 (reset) in each candidate TLMM tile: cfg at +0, io at +4 */
+	for (int t = 0; t < 3; t++) {
+		uintptr_t base = TLMM_BASE + tile[t];
+
+		pair(t == 0 ? "NORTH" : (t == 1 ? "SOUTH" : "WEST"), -1, "p31cfg=", rd32(base + 31 * 0x1000),
+		     "io=", rd32(base + 31 * 0x1000 + 4));
+		pair(" ", -1, "p32cfg=", rd32(base + 32 * 0x1000), "io=", rd32(base + 32 * 0x1000 + 4));
+	}
+	flush_log();
+	render(C_BLUE, "touch probe 1/2: clocks + pins");
+	delay_ms(7000);
+
+	/* Risky step: if SE6's clocks are off this read aborts and the panic screen names it. */
+	msg("STEP", "reading SE6 registers");
+	flush_log();
+	pair("SE6", -1, "status=", rd32(SE6_BASE + SE_STATUS), "fw=", rd32(SE6_BASE + SE_FW));
+	pair(" ", -1, "hwtx=", rd32(SE6_BASE + SE_HW_TX), "hwrx=", rd32(SE6_BASE + SE_HW_RX));
+	pair(" ", -1, "txcnt=", rd32(SE6_BASE + SE_TX_COUNT), "rxcnt=", rd32(SE6_BASE + SE_RX_COUNT));
+	pair(" ", -1, "irq=", rd32(SE6_BASE + SE_IRQ), 0, 0);
+	flush_log();
+
+	rc = se6_read(0x49, b, 1, &last);
+	pair("I2C49", -1, "rc=", (uint32_t)rc, "irq=", last);
+	pair(" ", -1, "byte=", b[0], 0, 0);
+	flush_log();
+	rc = se6_read(0x4a, b, 1, &last);
+	pair("I2C4A", -1, "rc=", (uint32_t)rc, "irq=", last);
+	pair(" ", -1, "rc:0ok 1nack", 0, "2err 3tmo", 0);
+	flush_log();
+	render(C_GREEN, "touch probe 2/2: SE6 + i2c");
+	delay_ms(120000);
 }
 
 void mi8_panic_log(const char *stage, uint64_t slot, uint64_t esr, uint64_t elr, uint64_t far)

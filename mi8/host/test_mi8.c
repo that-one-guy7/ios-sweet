@@ -79,10 +79,13 @@ int main(void)
 	bad += check_zone(ram[0], "ystr=000010e0");
 	bad += check_zone(ram[0], "FBUSE base=9d400000 str4=00000438");
 	bad += check_zone(ram[0], "PP0C cnt=");
-	if (renders != 8 || mdp_writes != 0) { printf("renders=%d mdp_writes=%d\n", renders, mdp_writes); bad++; }
+	if (renders != 4 || mdp_writes != 0) { printf("renders=%d mdp_writes=%d\n", renders, mdp_writes); bad++; }
 	if ((uintptr_t)con_fb != 0x9d400000 || con_stride4 != 1080) { printf("fb=%p stride4=%u\n", (void *)con_fb, con_stride4); bad++; }
 	printf("titles: %s | %s | %s | %s\n", screen_titles[0], screen_titles[1], screen_titles[2], screen_titles[3]);
 
+	mi8_touch_probe();
+	bad += check_zone(ram[0], "TOUCH mi8 touch discovery");
+	bad += check_zone(ram[0], "I2C49 rc=");
 	/* no active pipe */
 	regs_sspp0_active = 0; renders = 0; mdp_writes = 0; con_fb = 0; con_stride4 = 1080;
 	mi8_diag(0);

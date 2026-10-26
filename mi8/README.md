@@ -1,5 +1,17 @@
 # Mi 8 (dipper, SDM845) bring-up
 
+**Touch probe (shim v3):** run the **mi8-shim** workflow and `fastboot boot mi8-diag-gz.img`. It cycles the four colours once,
+then shows two green/blue screens about the Mi 8 touch controller (STM FTS at I2C 0x49 on SE6 @ 0xa98000; irq GPIO31,
+reset GPIO32; avdd = pm8998_l28 via RPMh, vdd = fixed `disp_vddio_vreg`): GCC clock vote, TLMM state of pins 31/32, SE6
+status registers, and one bounded I2C read at 0x49 and 0x4a (`rc` 0 ok, 1 NACK, 2 error, 3 timeout). It resets to Android
+after about 2 minutes. If SE6's clocks are off the SE6 read aborts and a PANIC screen names it. Read-only except that one I2C
+read; it never powers anything. Build with `-DMI8_UFS_PROBE` to get the old UFS probe back.
+
+**Boot 1 result (2026-10-25):** kernel text on screen up to `zone_init`, then frozen on both images. Cause found in the
+patches: the boot-CPU driver (0018) and AppleKeyStore (0038) match `IONameMatch qcom,kryo470`, and mkadt had replaced it
+with `qcom,kryo385`, so no CPU driver attached. Fixed (both strings kept). Rebuild only the images, no macOS run needed:
+Actions -> **mi8-image** -> run id of the green xnu run.
+
 **Milestone 1 (kernel boot):** fork dipa-studio/ios-sweet on GitHub (public, so macOS runners are free), upload this
 overlay on top, run the **xnu** workflow (macOS, 30-90 min; board defaults to `mi8`). Its second job builds the
 device tree (`tools/mkadt.py --board mi8`), the payload, and the boot images `mi8-xnu-gz.img` / `mi8-xnu-ucomp.img`

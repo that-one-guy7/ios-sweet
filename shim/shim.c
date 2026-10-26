@@ -400,6 +400,11 @@ void shim_main(uint64_t dtb)
 	 * read-only UFS probe below on a clean screen, then reset to Android after ~3 min. */
 	stage = "mi8 diag";
 	mi8_diag(dtb);
+	stage = "mi8 touch probe";
+	mi8_touch_probe();
+#ifndef MI8_UFS_PROBE
+	reset(20);	/* UFS already verified on this phone; build with -DMI8_UFS_PROBE to run it again */
+#endif
 	con_clear(BLUE);
 	con_str("MI8", "ufs probe (read-only)");
 #endif
