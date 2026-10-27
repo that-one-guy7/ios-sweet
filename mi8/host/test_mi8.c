@@ -20,7 +20,7 @@ void con_hex2(const char *l, const char *a, uint32_t va, const char *b, uint32_t
 static uint8_t ram[2][0x40000];
 static uint32_t regs_sspp0_active = 1;
 static uint64_t tick;
-static int vote_done, cmd_done;
+static int vote_done, cmd_done, cgc_done;
 
 uint64_t ticks(void) { return tick += 1000; }
 uint64_t tfreq(void) { return 19200000; }
@@ -43,7 +43,8 @@ uint32_t rd32(uintptr_t a)
 	if (a == 0x0ae00000UL) return 0x40000000;
 	/* touch bring-up fakes: SE6 clocks off until the vote is written, then an unpowered chip NACKs */
 	if (a == 0x00100000UL + 0x18868) return 0x80000000;			/* RCG root off */
-	if (a == 0x00100000UL + 0x18864 || a == 0x00100000UL + 0x18004 || a == 0x00100000UL + 0x18008 ||
+	if (a == 0x00100000UL + 0x18864) return (vote_done && cgc_done) ? 0 : 0x80004220;	/* SE6 branch needs the SE's own request */
+	if (a == 0x00100000UL + 0x18004 || a == 0x00100000UL + 0x18008 ||
 	    a == 0x00100000UL + 0x1800c || a == 0x00100000UL + 0x18010) return vote_done ? 0 : 0x80000000;
 	if (a == 0x00a98000UL + 0x68) return 0x300;
 	if (a == 0x00a98000UL + 0xe24) return 0x20202864;
@@ -58,6 +59,7 @@ void wr32(uintptr_t a, uint32_t v)
 	if (a >= 0xb0100000UL && a < 0xb0140000UL) { memcpy(&ram[0][a - 0xb0100000UL], &v, 4); return; }
 	if (a == 0x00100000UL + 0x5200c) vote_done = 1;
 	if (a == 0x00a98000UL + 0x600) cmd_done = 1;
+	if (a == 0x00a98000UL + 0x28) cgc_done = 1;
 	if (a >= 0x0ae00000UL && a < 0x0af00000UL) mdp_writes++;	/* v2 must never write the display block */
 }
 void wr8(uintptr_t a, uint8_t v)
@@ -98,6 +100,8 @@ int main(void)
 	bad += check_zone(ram[0], "TOUCH mi8 touch bring-up v4");
 	bad += check_zone(ram[0], "CLK rc=00000000");
 	bad += check_zone(ram[0], "SEINIT rc=00000000");
+	bad += check_zone(ram[0], "CLK6 ok=00000001");
+	bad += check_zone(ram[0], "SEBR7 br=");
 	bad += check_zone(ram[0], "I2C49 rc=00000001");
 	/* no active pipe */
 	regs_sspp0_active = 0; renders = 0; mdp_writes = 0; con_fb = 0; con_stride4 = 1080;

@@ -351,7 +351,10 @@ void mi8_diag(uintptr_t dtb)
  * avdd = pm8998_l28 3.3 V (RPMh, NOT touched here), vdd = fixed disp_vddio_vreg.
  * v3 result on a real phone: SE6 has I2C firmware (fw=0x300) and 32-bit FIFOs, but its clock is off (vote bit 28
  * clear, RCG root off), so the I2C read timed out; pins 31/32 sit in the suspend state (output, io=0).
- * v4 does what sweet's driver does, with the SDM845 GCC offsets (wrapper1 S6: RCG 0x18868, branch 0x18864, vote
+ * v4 result: the vote worked for wrapper1 core/ahb (branches 0-3 came on) but the SE6 branch (0x18864) stayed off:
+ * the SE itself requests its serial clock, and only does so once its clock-gating overrides (GENI_CGC_CTRL 0x28,
+ * 0xe30 ...) are set - which sweet's se_init writes AFTER its clock wait (ABL had already set them on sweet).
+ * v5 therefore votes, runs the SE init, THEN waits for the SE6 branch. It does what sweet's driver does, with the SDM845 GCC offsets (wrapper1 S6: RCG 0x18868, branch 0x18864, vote
  * bit 28; wrapper1 core/ahb: bits 18-21): vote the clocks, init the GENI SE exactly like sweet_touch.c, release
  * the touch pins, then one I2C read at 0x49 and 0x4a. Expected: rc=1 (NACK) = master works, chip unpowered
  * (needs the RPMh L28 vote); rc=0 = chip answered. GCC writes happen only if the registers look as expected. */
@@ -399,11 +402,11 @@ static int wait_clear(uintptr_t addr, uint32_t mask)
 	return 0;
 }
 
-/* 0 ok; 1 sanity check failed (nothing written); 2 DFS level 0 is not XO; 3 RCG update timeout; 4+n branch n stuck */
+/* 0 ok; 1 sanity check failed (nothing written); 2 DFS level 0 is not XO; 3 RCG update timeout; 4+n wrapper branch n stuck */
 static int se6_clocks(void)
 {
 	uintptr_t rcg = GCC_BASE + GCC_RCG_W1S6;
-	static const uint32_t br[5] = { 0x18004, 0x18008, 0x1800c, 0x18010, GCC_BR_S6 };
+	static const uint32_t br[4] = { 0x18004, 0x18008, 0x1800c, 0x18010 };
 	uint32_t cfg, vote;
 
 	if (!(rd32(rcg) & 0x80000000U) || !(rd32(GCC_BASE + GCC_BR_S6) & 0x80000000U))
@@ -421,7 +424,7 @@ static int se6_clocks(void)
 		if (!wait_clear(rcg, 1U))
 			return 3;
 	}
-	for (unsigned i = 0; i < 5; i++)
+	for (unsigned i = 0; i < 4; i++)	/* wrapper1 core_2x, core, m_ahb, s_ahb; the SE6 branch waits for se6_init */
 		if (!wait_clear(GCC_BASE + br[i], 0x80000000U))
 			return 4 + (int)i;
 	return 0;
@@ -545,6 +548,18 @@ void mi8_touch_probe(void)
 
 	ini = ck ? 9 : se6_init();
 	pair("SEINIT", -1, "rc=", (uint32_t)ini, "st=", rd32(SE6_BASE + SE_STATUS));
+	if (!ini) {
+		int w = wait_clear(GCC_BASE + GCC_BR_S6, 0x80000000U);
+
+		pair("CLK6", -1, "ok=", (uint32_t)w, "br6=", rd32(GCC_BASE + GCC_BR_S6));
+		pair(" ", -1, "cmd=", rd32(GCC_BASE + GCC_RCG_W1S6), "cgc=", rd32(SE6_BASE + 0x28));
+		/* all wrapper1 SE branches/RCGs: which serial clocks are really on */
+		for (int n = 0; n < 8; n++) {
+			uintptr_t bq = GCC_BASE + GCC_BR_S6 - (uintptr_t)(6 - n) * 0x130;
+
+			pair("SEBR", n, "br=", rd32(bq), "rcg=", rd32(bq + 4));
+		}
+	}
 	flush_log();
 	if (!ini) {
 		touch_gpio(31, 0, 3, 3, 0);	/* interrupt: input, pull-up, 8 mA */

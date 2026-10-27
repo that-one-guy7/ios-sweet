@@ -1,9 +1,11 @@
 # Mi 8 (dipper, SDM845) bring-up
 
-**Touch bring-up probe (shim v4):** run **mi8-shim**, `fastboot boot mi8-diag-gz.img`. v3 showed SE6 (the touch I2C
+**Touch bring-up probe (shim v5):** run **mi8-shim**, `fastboot boot mi8-diag-gz.img`. v3 showed SE6 (the touch I2C
 controller) has I2C firmware (`fw=0x300`) but its clock is off and the touch pins are parked in suspend. v4 votes the
 SDM845 wrapper1/SE6 clocks (only if the GCC registers look as expected), runs sweet's GENI init verbatim, releases the
-touch pins (irq input, reset high), then reads one byte from 0x49 and 0x4a. `rc` 0 = the chip answered, 1 = NACK (the
+touch pins (irq input, reset high), then reads one byte from 0x49 and 0x4a. v4 result on a real phone: the wrapper1 core/ahb clocks came on but the SE6 branch stayed off
+(`CLK rc=8`); v5 runs the SE init (which sets the SE's own clock-gating overrides) before waiting for that branch, and prints
+all eight wrapper1 SE branches (`SEBRn`) so the real bit/offset mapping is visible. `rc` 0 = the chip answered, 1 = NACK (the
 I2C master works, the chip is unpowered: needs the RPMh pm8998_l28 vote), 2 = bus error, 3 = timeout. `CLK rc` 0 = ok,
 1 = sanity check failed and nothing was written. Resets to Android after about 2 minutes.
 
