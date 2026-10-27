@@ -20,7 +20,6 @@ void con_hex2(const char *l, const char *a, uint32_t va, const char *b, uint32_t
 static uint8_t ram[2][0x40000];
 static uint32_t regs_sspp0_active = 1;
 static uint64_t tick;
-static int vote_done, cmd_done, cgc_done;
 
 uint64_t ticks(void) { return tick += 1000; }
 uint64_t tfreq(void) { return 19200000; }
@@ -34,6 +33,51 @@ uint64_t host_rsr(const char *n)
 	return 0;
 }
 
+#define TLMM_N 0x03900000UL
+static uint32_t pcfg[160], pout[160];
+
+/* --- I2C slave model on SDA = gpio33, SCL = gpio34: FTS-like device at 0x49, reg 0x80 returns 36 01 02 03 ... --- */
+enum { S_IDLE, S_ADDR, S_ACKA, S_WR, S_ACKW, S_RD, S_MACK, S_IGN };
+static int st = S_IDLE, bits, rw, slave_low, regptr = -1, rdi, expect_reg, mack;
+static unsigned shift;
+static int last_sda = 1, last_scl = 1;
+
+static int master_low(unsigned pin) { return (pcfg[pin] & 0x200) && !(pout[pin] & 1); }
+static int line_sda(void) { return !master_low(33) && !slave_low; }
+static int line_scl(void) { return !master_low(34); }
+static unsigned char rdbyte(void) { return regptr == 0x80 ? (unsigned char[]){0x36, 1, 2, 3, 4, 5, 6, 7}[rdi & 7] : 0xA5; }
+
+static void slave_step(void)
+{
+	int sda = line_sda(), scl = line_scl();
+
+	if (scl && last_scl && last_sda && !sda) { st = S_ADDR; bits = 0; shift = 0; expect_reg = 1; }	/* START */
+	else if (scl && last_scl && !last_sda && sda) { st = S_IDLE; slave_low = 0; }				/* STOP */
+	else if (scl && !last_scl) {										/* rising */
+		if (st == S_ADDR || st == S_WR) { shift = (shift << 1) | (unsigned)sda; bits++; }
+		else if (st == S_MACK) mack = !sda;
+	} else if (!scl && last_scl) {										/* falling */
+		if (st == S_ADDR && bits == 8) {
+			rw = shift & 1;
+			if ((shift >> 1) == 0x49) { st = S_ACKA; slave_low = 1; } else st = S_IGN;
+		} else if (st == S_ACKA) {
+			slave_low = 0;
+			if (rw) { st = S_RD; bits = 0; rdi = 0; slave_low = !(rdbyte() & 0x80); } else { st = S_WR; bits = 0; shift = 0; }
+		} else if (st == S_WR && bits == 8) {
+			if (expect_reg) { regptr = (int)shift; expect_reg = 0; }
+			st = S_ACKW; slave_low = 1;
+		} else if (st == S_ACKW) { slave_low = 0; st = S_WR; bits = 0; shift = 0; }
+		else if (st == S_RD) {
+			bits++;
+			if (bits == 8) { slave_low = 0; st = S_MACK; }
+			else if (bits > 0) slave_low = !((rdbyte() >> (7 - bits)) & 1);
+		} else if (st == S_MACK) {
+			if (mack) { rdi++; st = S_RD; bits = 0; slave_low = !(rdbyte() & 0x80); } else { st = S_IGN; slave_low = 0; }
+		}
+	}
+	last_sda = line_sda(); last_scl = line_scl();
+}
+
 uint32_t rd32(uintptr_t a)
 {
 	if (a == 0x0ae00000UL + 0x5000 + 0x14 && regs_sspp0_active) return 0x9d400000;
@@ -41,15 +85,16 @@ uint32_t rd32(uintptr_t a)
 	if (a == 0x0ae00000UL + 0x5000 + 0x30 && regs_sspp0_active) return 0x000236ff;
 	if (a == 0x0ae00000UL + 0x5000 + 0x00 && regs_sspp0_active) return 0x08c80438;
 	if (a == 0x0ae00000UL) return 0x40000000;
-	/* touch bring-up fakes: SE6 clocks off until the vote is written, then an unpowered chip NACKs */
-	if (a == 0x00100000UL + 0x18868) return 0x80000000;			/* RCG root off */
-	if (a == 0x00100000UL + 0x18864) return (vote_done && cgc_done) ? 0 : 0x80004220;	/* SE6 branch needs the SE's own request */
-	if (a == 0x00100000UL + 0x18004 || a == 0x00100000UL + 0x18008 ||
-	    a == 0x00100000UL + 0x1800c || a == 0x00100000UL + 0x18010) return vote_done ? 0 : 0x80000000;
-	if (a == 0x00a98000UL + 0x68) return 0x300;
-	if (a == 0x00a98000UL + 0xe24) return 0x20202864;
-	if (a == 0x00a98000UL + 0xe28) return 0x20204900;
-	if (a == 0x00a98000UL + 0x610) return cmd_done ? ((1U << 10) | 1U) : 0;	/* NACK + DONE after a command */
+	if (a >= TLMM_N && a < TLMM_N + 160 * 0x1000UL) {	/* TLMM north tile: cfg at pin*0x1000, io at +4 */
+		unsigned pin = (unsigned)((a - TLMM_N) / 0x1000), off = (unsigned)((a - TLMM_N) % 0x1000);
+		if (off == 0) return pcfg[pin];
+		if (off == 4) {
+			unsigned in = (pcfg[pin] & 0x200) ? (pout[pin] & 1) : 1;
+			if (pin == 33) in = (unsigned)line_sda();
+			if (pin == 34) in = (unsigned)line_scl();
+			return in | (pout[pin] << 1);
+		}
+	}
 	return 0;
 }
 
@@ -57,9 +102,13 @@ void wr32(uintptr_t a, uint32_t v)
 {
 	if (a >= 0xb0120000UL && a < 0xb0160000UL) { memcpy(&ram[1][a - 0xb0120000UL], &v, 4); return; }
 	if (a >= 0xb0100000UL && a < 0xb0140000UL) { memcpy(&ram[0][a - 0xb0100000UL], &v, 4); return; }
-	if (a == 0x00100000UL + 0x5200c) vote_done = 1;
-	if (a == 0x00a98000UL + 0x600) cmd_done = 1;
-	if (a == 0x00a98000UL + 0x28) cgc_done = 1;
+	if (a >= TLMM_N && a < TLMM_N + 160 * 0x1000UL) {
+		unsigned pin = (unsigned)((a - TLMM_N) / 0x1000), off = (unsigned)((a - TLMM_N) % 0x1000);
+		if (off == 0) pcfg[pin] = v;
+		if (off == 4) pout[pin] = (v >> 1) & 1;
+		if (pin == 33 || pin == 34) slave_step();
+		return;
+	}
 	if (a >= 0x0ae00000UL && a < 0x0af00000UL) mdp_writes++;	/* v2 must never write the display block */
 }
 void wr8(uintptr_t a, uint8_t v)
@@ -97,12 +146,13 @@ int main(void)
 	printf("titles: %s | %s | %s | %s\n", screen_titles[0], screen_titles[1], screen_titles[2], screen_titles[3]);
 
 	mi8_touch_probe();
-	bad += check_zone(ram[0], "TOUCH mi8 touch bring-up v4");
-	bad += check_zone(ram[0], "CLK rc=00000000");
-	bad += check_zone(ram[0], "SEINIT rc=00000000");
-	bad += check_zone(ram[0], "CLK6 ok=00000001");
-	bad += check_zone(ram[0], "SEBR7 br=");
-	bad += check_zone(ram[0], "I2C49 rc=00000001");
+	if (getenv("DEBUG_DUMP")) { uint32_t sz; memcpy(&sz, ram[0] + 8, 4); fwrite(ram[0] + 12, 1, sz, stdout); }
+	bad += check_zone(ram[0], "TOUCH mi8 touch v6: gpio bit-bang i2c");
+	bad += check_zone(ram[0], "BBPINS0 sda=00000021 idle=00000003");	/* both lines idle high */
+	bad += check_zone(ram[0], "BBPINS1 sda=00000022 idle=00000003");
+	bad += check_zone(ram[0], "I2C490 rc=00000000 byte=000000a5");		/* FTS-like slave at 0x49 ACKs */
+	bad += check_zone(ram[0], "I2C4A0 rc=00000001");			/* nothing at 0x4a: NACK */
+	bad += check_zone(ram[0], "INFO0 rc=00000000 b0-3=03020136");	/* register 0x80 read with repeated start */
 	/* no active pipe */
 	regs_sspp0_active = 0; renders = 0; mdp_writes = 0; con_fb = 0; con_stride4 = 1080;
 	mi8_diag(0);

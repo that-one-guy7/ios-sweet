@@ -1,13 +1,12 @@
 # Mi 8 (dipper, SDM845) bring-up
 
-**Touch bring-up probe (shim v5):** run **mi8-shim**, `fastboot boot mi8-diag-gz.img`. v3 showed SE6 (the touch I2C
-controller) has I2C firmware (`fw=0x300`) but its clock is off and the touch pins are parked in suspend. v4 votes the
-SDM845 wrapper1/SE6 clocks (only if the GCC registers look as expected), runs sweet's GENI init verbatim, releases the
-touch pins (irq input, reset high), then reads one byte from 0x49 and 0x4a. v4 result on a real phone: the wrapper1 core/ahb clocks came on but the SE6 branch stayed off
-(`CLK rc=8`); v5 runs the SE init (which sets the SE's own clock-gating overrides) before waiting for that branch, and prints
-all eight wrapper1 SE branches (`SEBRn`) so the real bit/offset mapping is visible. `rc` 0 = the chip answered, 1 = NACK (the
-I2C master works, the chip is unpowered: needs the RPMh pm8998_l28 vote), 2 = bus error, 3 = timeout. `CLK rc` 0 = ok,
-1 = sanity check failed and nothing was written. Resets to Android after about 2 minutes.
+**Touch probe (shim v6, GPIO bit-bang I2C):** v5 showed the touch I2C controller (i2c@a98000 = global SE14, pins gpio33/34
+function qup14) has its FIFO interface disabled (`SE_FIFO_IF_DISABLE_RO` 0x64 bit0, the SE is GSI/DMA-only), so sweet's
+FIFO-mode driver cannot run on it. Same case as the LG V60 port, which bit-bangs the bus. v6 touches no GCC or SE
+register: it releases the touch pins (gpio31 irq input pull-up, gpio32 reset high), then bit-bangs I2C on gpio33/34
+(both SDA/SCL orders) and reads one byte at 0x49 and 0x4a, plus register 0x80 (ST FTS info block). `rc` 0 = ACK, 1 = NACK
+(the chip is unpowered or not there), 2 = bus stuck. `idle=3` means both lines idle high (pull-ups present).
+The host test drives this code against an I2C slave model (plain read, register read with repeated start, NACK).
 
 **Boot 1 result (2026-10-25):** kernel text on screen up to `zone_init`, then frozen on both images. Cause found in the
 patches: the boot-CPU driver (0018) and AppleKeyStore (0038) match `IONameMatch qcom,kryo470`, and mkadt had replaced it
