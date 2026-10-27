@@ -20,6 +20,7 @@ void con_hex2(const char *l, const char *a, uint32_t va, const char *b, uint32_t
 static uint8_t ram[2][0x40000];
 static uint32_t regs_sspp0_active = 1;
 static uint64_t tick;
+static int vote_done, cmd_done;
 
 uint64_t ticks(void) { return tick += 1000; }
 uint64_t tfreq(void) { return 19200000; }
@@ -40,6 +41,14 @@ uint32_t rd32(uintptr_t a)
 	if (a == 0x0ae00000UL + 0x5000 + 0x30 && regs_sspp0_active) return 0x000236ff;
 	if (a == 0x0ae00000UL + 0x5000 + 0x00 && regs_sspp0_active) return 0x08c80438;
 	if (a == 0x0ae00000UL) return 0x40000000;
+	/* touch bring-up fakes: SE6 clocks off until the vote is written, then an unpowered chip NACKs */
+	if (a == 0x00100000UL + 0x18868) return 0x80000000;			/* RCG root off */
+	if (a == 0x00100000UL + 0x18864 || a == 0x00100000UL + 0x18004 || a == 0x00100000UL + 0x18008 ||
+	    a == 0x00100000UL + 0x1800c || a == 0x00100000UL + 0x18010) return vote_done ? 0 : 0x80000000;
+	if (a == 0x00a98000UL + 0x68) return 0x300;
+	if (a == 0x00a98000UL + 0xe24) return 0x20202864;
+	if (a == 0x00a98000UL + 0xe28) return 0x20204900;
+	if (a == 0x00a98000UL + 0x610) return cmd_done ? ((1U << 10) | 1U) : 0;	/* NACK + DONE after a command */
 	return 0;
 }
 
@@ -47,6 +56,8 @@ void wr32(uintptr_t a, uint32_t v)
 {
 	if (a >= 0xb0120000UL && a < 0xb0160000UL) { memcpy(&ram[1][a - 0xb0120000UL], &v, 4); return; }
 	if (a >= 0xb0100000UL && a < 0xb0140000UL) { memcpy(&ram[0][a - 0xb0100000UL], &v, 4); return; }
+	if (a == 0x00100000UL + 0x5200c) vote_done = 1;
+	if (a == 0x00a98000UL + 0x600) cmd_done = 1;
 	if (a >= 0x0ae00000UL && a < 0x0af00000UL) mdp_writes++;	/* v2 must never write the display block */
 }
 void wr8(uintptr_t a, uint8_t v)
@@ -84,8 +95,10 @@ int main(void)
 	printf("titles: %s | %s | %s | %s\n", screen_titles[0], screen_titles[1], screen_titles[2], screen_titles[3]);
 
 	mi8_touch_probe();
-	bad += check_zone(ram[0], "TOUCH mi8 touch discovery");
-	bad += check_zone(ram[0], "I2C49 rc=");
+	bad += check_zone(ram[0], "TOUCH mi8 touch bring-up v4");
+	bad += check_zone(ram[0], "CLK rc=00000000");
+	bad += check_zone(ram[0], "SEINIT rc=00000000");
+	bad += check_zone(ram[0], "I2C49 rc=00000001");
 	/* no active pipe */
 	regs_sspp0_active = 0; renders = 0; mdp_writes = 0; con_fb = 0; con_stride4 = 1080;
 	mi8_diag(0);

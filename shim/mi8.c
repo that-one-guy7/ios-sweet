@@ -346,23 +346,30 @@ void mi8_diag(uintptr_t dtb)
 	flush_log();
 }
 
-/* ---- touch discovery (read-mostly) ----
- * Mi 8 touch: STM FTS at i2c 0x49 on i2c@a98000 (QUPV3_1 SE6), irq GPIO31, reset GPIO32,
- * avdd = pm8998_l28 3.3 V (RPMh), vdd = disp_vddio_vreg (fixed). Question for this probe: did ABL leave the
- * rails on and SE6 usable? Everything is a read except one bounded I2C read transaction on SE6. Offsets for the
- * GCC lines come from memory of the SDM845 clock tree (unverified); the GENI SE registers are the standard ones
- * sweet's driver uses. */
+/* ---- touch bring-up probe (v4) ----
+ * Mi 8 touch: STM FTS at i2c 0x49 on i2c@a98000 (QUPV3_1 SE6), irq GPIO31, reset GPIO32 (TLMM north tile),
+ * avdd = pm8998_l28 3.3 V (RPMh, NOT touched here), vdd = fixed disp_vddio_vreg.
+ * v3 result on a real phone: SE6 has I2C firmware (fw=0x300) and 32-bit FIFOs, but its clock is off (vote bit 28
+ * clear, RCG root off), so the I2C read timed out; pins 31/32 sit in the suspend state (output, io=0).
+ * v4 does what sweet's driver does, with the SDM845 GCC offsets (wrapper1 S6: RCG 0x18868, branch 0x18864, vote
+ * bit 28; wrapper1 core/ahb: bits 18-21): vote the clocks, init the GENI SE exactly like sweet_touch.c, release
+ * the touch pins, then one I2C read at 0x49 and 0x4a. Expected: rc=1 (NACK) = master works, chip unpowered
+ * (needs the RPMh L28 vote); rc=0 = chip answered. GCC writes happen only if the registers look as expected. */
 #define GCC_BASE	0x00100000UL
 #define GCC_QUP_VOTE	0x5200c
 #define GCC_RCG_W1S6	0x18868
-#define TLMM_BASE	0x03400000UL
+#define GCC_BR_S6	0x18864
+#define TLMM_NORTH	0x03900000UL
 #define SE6_BASE	0x00a98000UL
 #define SE_STATUS	0x040
 #define SE_FW		0x068
+#define SE_DMA		0x258
 #define SE_RX_LEN	0x270
+#define SE_SCL		0x278
 #define SE_CMD		0x600
 #define SE_CTRL		0x604
 #define SE_IRQ		0x610
+#define SE_IRQ_EN	0x614
 #define SE_IRQ_CLR	0x618
 #define SE_RX		0x780
 #define SE_TX_COUNT	0x800
@@ -371,7 +378,8 @@ void mi8_diag(uintptr_t dtb)
 #define SE_HW_RX	0xe28
 #define SE_DONE		(1U << 0)
 #define SE_NACK		(1U << 10)
-#define SE_ERRORS	(0x0eU | (1U << 9) | (1U << 10) | (1U << 12) | (1U << 13) | (3U << 24) | (3U << 28))
+#define SE_ERRORS	(0x3eU | (1U << 9) | (1U << 10) | (1U << 12) | (1U << 13) | (3U << 24) | (3U << 28))
+#define SE_EVENTS	(SE_DONE | SE_ERRORS | (1U << 26) | (1U << 27) | (1U << 30))
 
 static void delay_us(unsigned us)
 {
@@ -381,14 +389,100 @@ static void delay_us(unsigned us)
 		;
 }
 
+static int wait_clear(uintptr_t addr, uint32_t mask)
+{
+	for (unsigned i = 0; i < 5000; i++) {
+		if (!(rd32(addr) & mask))
+			return 1;
+		delay_us(1);
+	}
+	return 0;
+}
+
+/* 0 ok; 1 sanity check failed (nothing written); 2 DFS level 0 is not XO; 3 RCG update timeout; 4+n branch n stuck */
+static int se6_clocks(void)
+{
+	uintptr_t rcg = GCC_BASE + GCC_RCG_W1S6;
+	static const uint32_t br[5] = { 0x18004, 0x18008, 0x1800c, 0x18010, GCC_BR_S6 };
+	uint32_t cfg, vote;
+
+	if (!(rd32(rcg) & 0x80000000U) || !(rd32(GCC_BASE + GCC_BR_S6) & 0x80000000U))
+		return 1;
+	vote = rd32(GCC_BASE + GCC_QUP_VOTE);
+	wr32(GCC_BASE + GCC_QUP_VOTE, vote | (0x0fU << 18) | (1U << 28));
+	if (rd32(rcg + 0x14) & 1U) {
+		if ((rd32(rcg + 0x1c) & 0x371fU) != 1U)
+			return 2;
+	} else {
+		cfg = rd32(rcg + 4);
+		cfg = (cfg & ~(0x371fU | (1U << 20))) | 1U;
+		wr32(rcg + 4, cfg);
+		wr32(rcg, rd32(rcg) | 1U);
+		if (!wait_clear(rcg, 1U))
+			return 3;
+	}
+	for (unsigned i = 0; i < 5; i++)
+		if (!wait_clear(GCC_BASE + br[i], 0x80000000U))
+			return 4 + (int)i;
+	return 0;
+}
+
+/* sweet_touch.c touch_se_init(), verbatim register programming (GENI SE layout is the same on every SoC). */
+static int se6_init(void)
+{
+	uint32_t fw = rd32(SE6_BASE + SE_FW), tx = rd32(SE6_BASE + SE_HW_TX), rx = rd32(SE6_BASE + SE_HW_RX);
+
+	if (((fw >> 8) & 0xffU) != 3U || (rd32(SE6_BASE + 0x64) & 1U) || ((tx >> 24) & 0x3fU) != 32U ||
+	    ((rx >> 24) & 0x3fU) != 32U || ((tx >> 16) & 0x3fU) < 2U || ((rx >> 16) & 0x3fU) < 2U)
+		return 1;
+	if (rd32(SE6_BASE + SE_STATUS) & 0x1001U)
+		return 2;
+	wr32(SE6_BASE + 0xe18, 0);
+	wr32(SE6_BASE + 0xe1c, 0);
+	wr32(SE6_BASE + 0x644, 0);
+	wr32(SE6_BASE + SE_IRQ_CLR, 0xffffffffU);
+	wr32(SE6_BASE + 0x648, 0xffffffffU);
+	wr32(SE6_BASE + SE_DMA, 0);
+	wr32(SE6_BASE + 0x28, rd32(SE6_BASE + 0x28) | 0x7fU);
+	wr32(SE6_BASE + 0xe30, rd32(SE6_BASE + 0xe30) | 0x0fU);
+	wr32(SE6_BASE + 0x24, 0x7f);
+	wr32(SE6_BASE + 0x20, 1);
+	wr32(SE6_BASE + 0x7c, 0);
+	wr32(SE6_BASE + 0x48, (7U << 4) | 1U);
+	wr32(SE6_BASE + SE_SCL, (10U << 20) | (11U << 10) | 26U);	/* 100 kHz */
+	wr32(SE6_BASE + 0x254, 0);
+	wr32(SE6_BASE + 0x260, 0x0004380eU);
+	wr32(SE6_BASE + 0x264, 0x000c3e0eU);
+	wr32(SE6_BASE + 0x284, 0x0004380eU);
+	wr32(SE6_BASE + 0x288, 0x000c3e0eU);
+	wr32(SE6_BASE + 0x80c, 1);
+	wr32(SE6_BASE + 0x810, 0);
+	wr32(SE6_BASE + 0x814, ((rx >> 16) & 0x3fU) - 1U);
+	wr32(SE6_BASE + SE_IRQ_EN, SE_EVENTS);
+	if ((rd32(SE6_BASE + SE_TX_COUNT) & 0xfffffffU) || (rd32(SE6_BASE + SE_RX_COUNT) & 0x1ffffffU))
+		return 3;
+	return 0;
+}
+
+/* sweet touch_gpio(): TLMM cfg at pin*0x1000, io at +4 (bit1 = output value) */
+static void touch_gpio(unsigned pin, unsigned mux, unsigned pull, unsigned drive, int out)
+{
+	uintptr_t off = TLMM_NORTH + pin * 0x1000U;
+	uint32_t cfg = rd32(off);
+
+	if (out)
+		wr32(off + 4, rd32(off + 4) | 2U);	/* latch high before enabling the output: no reset pulse */
+	cfg &= ~0x3ffU;
+	cfg |= (mux << 2) | pull | (drive << 6) | (out ? 0x200U : 0U);
+	wr32(off, cfg);
+}
+
 /* 0 ok, 1 NACK, 2 bus error, 3 timeout. *last = last IRQ status seen. */
 static int se6_read(uint8_t addr, uint8_t *buf, unsigned nr, uint32_t *last)
 {
 	unsigned got = 0;
 
-	for (unsigned i = 0; i < 5000 && (rd32(SE6_BASE + SE_STATUS) & 1U); i++)
-		delay_us(1);
-	if (rd32(SE6_BASE + SE_STATUS) & 1U)
+	if (!wait_clear(SE6_BASE + SE_STATUS, 1U))
 		return 3;
 	wr32(SE6_BASE + SE_IRQ_CLR, 0xffffffffU);
 	wr32(SE6_BASE + SE_RX_LEN, nr);
@@ -403,6 +497,7 @@ static int se6_read(uint8_t addr, uint8_t *buf, unsigned nr, uint32_t *last)
 				delay_us(1);
 				irq = rd32(SE6_BASE + SE_IRQ);
 			}
+			*last = irq;
 			wr32(SE6_BASE + SE_IRQ_CLR, irq);
 			return (irq & SE_NACK) ? 1 : 2;
 		}
@@ -428,46 +523,46 @@ static int se6_read(uint8_t addr, uint8_t *buf, unsigned nr, uint32_t *last)
 
 void mi8_touch_probe(void)
 {
-	static const uint32_t tile[3] = { 0x500000, 0x900000, 0x100000 };
 	uint8_t b[4] = { 0, 0, 0, 0 };
 	uint32_t last = 0;
-	int rc;
+	int ck, ini, rc;
 
 	nl = 0;
 	tick_i = -1;
-	msg("TOUCH", "mi8 touch discovery (read-only)");
-	pair("GCC", -1, "qupvt=", rd32(GCC_BASE + GCC_QUP_VOTE), 0, 0);
+	msg("TOUCH", "mi8 touch bring-up v4");
+	pair("GCC", -1, "qupvt=", rd32(GCC_BASE + GCC_QUP_VOTE), "br6=", rd32(GCC_BASE + GCC_BR_S6));
 	pair("RCG", -1, "cmd=", rd32(GCC_BASE + GCC_RCG_W1S6), "cfg=", rd32(GCC_BASE + GCC_RCG_W1S6 + 4));
-	/* pins 31 (irq) and 32 (reset) in each candidate TLMM tile: cfg at +0, io at +4 */
-	for (int t = 0; t < 3; t++) {
-		uintptr_t base = TLMM_BASE + tile[t];
+	pair(" ", -1, "dfs=", rd32(GCC_BASE + GCC_RCG_W1S6 + 0x14), "l0=", rd32(GCC_BASE + GCC_RCG_W1S6 + 0x1c));
+	pair("PINS", -1, "p31=", rd32(TLMM_NORTH + 31 * 0x1000U), "p32=", rd32(TLMM_NORTH + 32 * 0x1000U));
+	flush_log();
 
-		pair(t == 0 ? "NORTH" : (t == 1 ? "SOUTH" : "WEST"), -1, "p31cfg=", rd32(base + 31 * 0x1000),
-		     "io=", rd32(base + 31 * 0x1000 + 4));
-		pair(" ", -1, "p32cfg=", rd32(base + 32 * 0x1000), "io=", rd32(base + 32 * 0x1000 + 4));
+	ck = se6_clocks();
+	pair("CLK", -1, "rc=", (uint32_t)ck, "vote=", rd32(GCC_BASE + GCC_QUP_VOTE));
+	pair(" ", -1, "br6=", rd32(GCC_BASE + GCC_BR_S6), "cmd=", rd32(GCC_BASE + GCC_RCG_W1S6));
+	flush_log();
+	render(C_BLUE, "touch v4 1/2: clocks");
+	delay_ms(6000);
+
+	ini = ck ? 9 : se6_init();
+	pair("SEINIT", -1, "rc=", (uint32_t)ini, "st=", rd32(SE6_BASE + SE_STATUS));
+	flush_log();
+	if (!ini) {
+		touch_gpio(31, 0, 3, 3, 0);	/* interrupt: input, pull-up, 8 mA */
+		touch_gpio(32, 0, 3, 3, 1);	/* reset released (output high) */
+		delay_ms(300);
+		pair("PINS2", -1, "p31io=", rd32(TLMM_NORTH + 31 * 0x1000U + 4), "p32io=",
+		     rd32(TLMM_NORTH + 32 * 0x1000U + 4));
+		flush_log();
+		rc = se6_read(0x49, b, 1, &last);
+		pair("I2C49", -1, "rc=", (uint32_t)rc, "irq=", last);
+		pair(" ", -1, "byte=", b[0], 0, 0);
+		flush_log();
+		rc = se6_read(0x4a, b, 1, &last);
+		pair("I2C4A", -1, "rc=", (uint32_t)rc, "irq=", last);
 	}
+	pair("LEGEND", -1, "rc 0=ack", 0, "1=nack", 0);
 	flush_log();
-	render(C_BLUE, "touch probe 1/2: clocks + pins");
-	delay_ms(7000);
-
-	/* Risky step: if SE6's clocks are off this read aborts and the panic screen names it. */
-	msg("STEP", "reading SE6 registers");
-	flush_log();
-	pair("SE6", -1, "status=", rd32(SE6_BASE + SE_STATUS), "fw=", rd32(SE6_BASE + SE_FW));
-	pair(" ", -1, "hwtx=", rd32(SE6_BASE + SE_HW_TX), "hwrx=", rd32(SE6_BASE + SE_HW_RX));
-	pair(" ", -1, "txcnt=", rd32(SE6_BASE + SE_TX_COUNT), "rxcnt=", rd32(SE6_BASE + SE_RX_COUNT));
-	pair(" ", -1, "irq=", rd32(SE6_BASE + SE_IRQ), 0, 0);
-	flush_log();
-
-	rc = se6_read(0x49, b, 1, &last);
-	pair("I2C49", -1, "rc=", (uint32_t)rc, "irq=", last);
-	pair(" ", -1, "byte=", b[0], 0, 0);
-	flush_log();
-	rc = se6_read(0x4a, b, 1, &last);
-	pair("I2C4A", -1, "rc=", (uint32_t)rc, "irq=", last);
-	pair(" ", -1, "rc:0ok 1nack", 0, "2err 3tmo", 0);
-	flush_log();
-	render(C_GREEN, "touch probe 2/2: SE6 + i2c");
+	render(C_GREEN, "touch v4 2/2: se6 init + i2c");
 	delay_ms(120000);
 }
 

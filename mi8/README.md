@@ -1,11 +1,11 @@
 # Mi 8 (dipper, SDM845) bring-up
 
-**Touch probe (shim v3):** run the **mi8-shim** workflow and `fastboot boot mi8-diag-gz.img`. It cycles the four colours once,
-then shows two green/blue screens about the Mi 8 touch controller (STM FTS at I2C 0x49 on SE6 @ 0xa98000; irq GPIO31,
-reset GPIO32; avdd = pm8998_l28 via RPMh, vdd = fixed `disp_vddio_vreg`): GCC clock vote, TLMM state of pins 31/32, SE6
-status registers, and one bounded I2C read at 0x49 and 0x4a (`rc` 0 ok, 1 NACK, 2 error, 3 timeout). It resets to Android
-after about 2 minutes. If SE6's clocks are off the SE6 read aborts and a PANIC screen names it. Read-only except that one I2C
-read; it never powers anything. Build with `-DMI8_UFS_PROBE` to get the old UFS probe back.
+**Touch bring-up probe (shim v4):** run **mi8-shim**, `fastboot boot mi8-diag-gz.img`. v3 showed SE6 (the touch I2C
+controller) has I2C firmware (`fw=0x300`) but its clock is off and the touch pins are parked in suspend. v4 votes the
+SDM845 wrapper1/SE6 clocks (only if the GCC registers look as expected), runs sweet's GENI init verbatim, releases the
+touch pins (irq input, reset high), then reads one byte from 0x49 and 0x4a. `rc` 0 = the chip answered, 1 = NACK (the
+I2C master works, the chip is unpowered: needs the RPMh pm8998_l28 vote), 2 = bus error, 3 = timeout. `CLK rc` 0 = ok,
+1 = sanity check failed and nothing was written. Resets to Android after about 2 minutes.
 
 **Boot 1 result (2026-10-25):** kernel text on screen up to `zone_init`, then frozen on both images. Cause found in the
 patches: the boot-CPU driver (0018) and AppleKeyStore (0038) match `IONameMatch qcom,kryo470`, and mkadt had replaced it
