@@ -33,6 +33,50 @@ uint64_t host_rsr(const char *n)
 	return 0;
 }
 
+
+/* --- RPMh fakes: apps_rsc DRV2, cmd-db with one VRM entry "ldoa28", TCS bank that completes on trigger --- */
+static uint32_t dbmem[0xdc0 / 4], tcsm[0x3000 / 4], irq_st, irq_en_fake, trig;
+static void rh_fake_init(void)
+{
+	dbmem[0] = 1; dbmem[1] = 0x0c0330db;
+	dbmem[8 / 4] = 0x00000004;			/* header 0: slave 4 (VRM), entries offset 0 */
+	dbmem[12 / 4] = 0x00010100;			/* aux offset 0x100, count 1 */
+	dbmem[144 / 4] = 0x616f646c; dbmem[148 / 4] = 0x00003832;	/* "ldoa28" */
+	dbmem[160 / 4] = 0x00040600;			/* VRM address */
+}
+static int in_win(uintptr_t a, uintptr_t base, uintptr_t size) { return a >= base && a < base + size; }
+static uint32_t rh_rd(uintptr_t a, int *hit)
+{
+	*hit = 1;
+	if (a == 0x179e0000UL) return 0x00020000;
+	if (a == 0x179e0004UL) return 1;
+	if (a == 0x179e000cUL) return (8U << 12) | (16U << 27);
+	if (a == 0x0c3f000cUL) return 0x85fe0000;
+	if (a == 0x0c3f0010UL) return 0xdc0;
+	if (in_win(a, 0x85fe0000UL, 0xdc0)) return dbmem[(a - 0x85fe0000UL) / 4];
+	if (in_win(a, 0x179e0d00UL, 0x3000)) {
+		unsigned off = (unsigned)(a - 0x179e0d00UL), t = off / 0x2a0, r = off % 0x2a0;
+		if (off == 0x00) return irq_en_fake;
+		if (off == 0x04) return irq_st;
+		if (r == 0x18) return 1;				/* idle */
+		if (r >= 0x3c && r < 0x3c + 3 * 0x14 && ((r - 0x3c) % 0x14) == 0) return trig ? 0x10100 : 0;
+		(void)t;
+		return tcsm[off / 4];
+	}
+	*hit = 0;
+	return 0;
+}
+static int rh_wr(uintptr_t a, uint32_t v)
+{
+	if (!in_win(a, 0x179e0d00UL, 0x3000)) return 0;
+	unsigned off = (unsigned)(a - 0x179e0d00UL), t = off / 0x2a0, r = off % 0x2a0;
+	if (off == 0x00) { irq_en_fake = v; return 1; }
+	if (off == 0x08) { irq_st &= ~v; return 1; }
+	if (r == 0x14 && (v & (1U << 24))) { trig = 1; irq_st |= 1U << t; }
+	tcsm[off / 4] = v;
+	return 1;
+}
+
 #define TLMM_N 0x03900000UL
 static uint32_t pcfg[160], pout[160];
 
@@ -80,6 +124,7 @@ static void slave_step(void)
 
 uint32_t rd32(uintptr_t a)
 {
+	{ int hit; uint32_t v = rh_rd(a, &hit); if (hit) return v; }
 	if (a == 0x0ae00000UL + 0x5000 + 0x14 && regs_sspp0_active) return 0x9d400000;
 	if (a == 0x0ae00000UL + 0x5000 + 0x2c && regs_sspp0_active) return 0x10e0;
 	if (a == 0x0ae00000UL + 0x5000 + 0x30 && regs_sspp0_active) return 0x000236ff;
@@ -100,6 +145,7 @@ uint32_t rd32(uintptr_t a)
 
 void wr32(uintptr_t a, uint32_t v)
 {
+	if (rh_wr(a, v)) return;
 	if (a >= 0xb0120000UL && a < 0xb0160000UL) { memcpy(&ram[1][a - 0xb0120000UL], &v, 4); return; }
 	if (a >= 0xb0100000UL && a < 0xb0140000UL) { memcpy(&ram[0][a - 0xb0100000UL], &v, 4); return; }
 	if (a >= TLMM_N && a < TLMM_N + 160 * 0x1000UL) {
@@ -145,11 +191,17 @@ int main(void)
 	if ((uintptr_t)con_fb != 0x9d400000 || con_stride4 != 1080) { printf("fb=%p stride4=%u\n", (void *)con_fb, con_stride4); bad++; }
 	printf("titles: %s | %s | %s | %s\n", screen_titles[0], screen_titles[1], screen_titles[2], screen_titles[3]);
 
+	rh_fake_init();
 	mi8_touch_probe();
 	if (getenv("DEBUG_DUMP")) { uint32_t sz; memcpy(&sz, ram[0] + 8, 4); fwrite(ram[0] + 12, 1, sz, stdout); }
-	bad += check_zone(ram[0], "TOUCH mi8 touch v6: gpio bit-bang i2c");
+	rh_fake_init();
+	bad += check_zone(ram[0], "TOUCH mi8 touch v7: rails + gpio i2c");
 	bad += check_zone(ram[0], "BBPINS0 sda=00000021 idle=00000003");	/* both lines idle high */
-	bad += check_zone(ram[0], "BBPINS1 sda=00000022 idle=00000003");
+	bad += check_zone(ram[0], "SELF0 hi=00000001 lo=00000000");
+	bad += check_zone(ram[0], "RAIL rc=00000000");
+	bad += check_zone(ram[0], "L28 addr=00040600");
+	bad += check_zone(ram[0], "I2C492 rc=00000000 byte=00000036");
+	bad += check_zone(ram[0], "INFO2 rc=00000000 b0-3=03020136");
 	bad += check_zone(ram[0], "I2C490 rc=00000000 byte=000000a5");		/* FTS-like slave at 0x49 ACKs */
 	bad += check_zone(ram[0], "I2C4A0 rc=00000001");			/* nothing at 0x4a: NACK */
 	bad += check_zone(ram[0], "INFO0 rc=00000000 b0-3=03020136");	/* register 0x80 read with repeated start */

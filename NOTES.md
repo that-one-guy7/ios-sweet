@@ -444,3 +444,50 @@ What it took today (in order): 0058 HID services (Apple IOHIDFamily-1915 user cl
   accepts a gzip'd shim Image + appended DTB (stock layout) - fallback is the UNCOMPRESSED_IMG container.
 - Not done: no CI run yet, nothing booted on hardware. Next: run `mi8-shim`, `fastboot boot` mi8-diag-gz.img, read the
   pstore log, decide the per-frame trigger, then port UFS/ADT (`tools/mkadt.py`) for 0x1d84000, GIC and the high RAM bank.
+
+### Mi 8 v1 on-device result (2026-10-24, from the owner's photo of the screen)
+
+- Pipeline left by ABL: SSPP0 addr `0x9d400000`, size `0x08c80438` (1080x2248), fmt `0x000237ff`; CTL0 top `0x00020020`;
+  PP0 tear `1`, vsync `0x0018008e`, height `0xffff`, **autorefresh `0x80000001`**; INTF1/2 timing engine off (command mode).
+  The SSPP ystride read at +0x2c returned 0 (wrong offset); 4320 bytes works (text rendered cleanly).
+- v1 sequence seen: red (shim start), blue (no trigger), red (CTL0 START), then no green/purple: manual kicks stop the
+  refresh. No kick is needed. CPU0 `midr=517f803c`, `tg16=1`, parange 2 (40-bit). DTB passed at `0x853fd000`.
+- v2 (this tree): no display writes, colour cycle, then read-only `test_ufs()` on a clean screen, reset to Android.
+
+### Mi 8 v2 on-device result (2026-10-25)
+
+- Colour cycle blue/red/green/purple all visible with no display writes (autorefresh confirmed).
+- sweet's read-only UFS probe worked on the Mi 8 as is: ver 0x210, hcs 0x10f, UTRLBA left by ABL `0x9b9ef000`, ours
+  `0x80096000`; LUN0 last LBA `0xdbffff`, block 4096, GPT ok. Partitions seen: persist 0x4000 (64M), persistbak 0x8000,
+  logdump 0xc000, minidump 0x10000, cust 0x18000 (ext4), recovery 0x4c000, cache 0x50000, system 0x60000 (7168M),
+  userdata 0x220000 (47615 MiB, ext4).
+- Kernel side prepared: `tools/mkadt.py --board mi8`, `mi8/patch-board.py` (0010/0012/0061 constants; 32 MB block stays at
+  0x9c000000, buffer 0x1400000 into it), workflow `xnu` gets `board` input and an `image` job. Untested: no kernel built yet.
+
+### Mi 8 touch facts from the live FDT (2026-10-26)
+
+- `i2c@a98000` = QUPV3_1 SE6 (wrapper `0xac0000`, irq 0x167, GSI dmas present). Children: `fts@49` (`st,fts`, irq GPIO31 level-low
+  `0x2008`, reset GPIO32, `fts,pwr-reg-name avdd`, `bus-reg-name vdd`) and `atmel_mxt_ts_640u@4a` (alternate panel supplier,
+  same pins/rails). avdd = `pm8998_l28` (`rpmh-regulator-ldoa28`, 3.3 V, RPMh); vdd = `disp_vddio_vreg` (`regulator-fixed`).
+- sweet's touch driver assumes ABL left GENI FW loaded and the rail powered ("no RPMh votes"); whether the Mi 8's ABL does
+  the same is unknown: the v3 shim probe measures it. Needed for a real driver: power (RPMh l28 + the fixed vddio), SE6 clocks
+  (GCC wrapper1 S6; sweet's offsets are SM7150's), and an FTS event decoder (mainline `stmfts` is the nearest reference).
+
+### Mi 8 touch probe results (2026-10-27)
+
+- v3: SE at 0xa98000 reads fine (fw 0x300 = I2C proto 3, 32-bit FIFOs) but its clock is off; touch pins 31/32 are in the north
+  tile at 0x3900000, parked as outputs (cfg 0x203, io 0).
+- v4/v5: GCC vote `0x5200c` bits 18-21 and 28 work for wrapper1 core/ahb (branches 0x18004..0x18010 come on); the SE6 branch
+  `0x18864` stays `0x80004220`. v5 `SEINIT rc=1`: sweet's init check failed, most likely `SE_FIFO_IF_DISABLE_RO` (0x64) bit0,
+  i.e. the SE is GSI-only (DT has `dmas`). The Mi 8 touch bus is global SE14: pins gpio33/gpio34, function qup14.
+- v6 (this tree): bit-banged I2C on gpio33/34 through TLMM (cfg bit9 = output enable), tested against a slave model. The
+  model found a real bug (missing R bit on plain reads). Rails (pm8998_l28 via RPMh) are still not touched.
+
+### Mi 8 touch v6 result and v7 (2026-10-28)
+
+- v6: gpio33/34 (north tile, default cfg 0x1 = gpio, pull-down) read low (`idle=0`) as inputs with pull-up (cfg 0x43), so
+  all bit-bang transfers returned stuck; gpio31 pull-up input reads high. Suspects: avdd (pm8998_l28, RPMh, `regulator-boot-on`
+  in DT but unverified) off with the chip clamping the bus, or TLMM writes to those pins not taking effect (v7 self-test).
+- vdd = `disp_vddio_vreg`: regulator-fixed, GPIO23 active-high enable, boot-on (the panel needs it, so it is on).
+- RSC `apps_rsc`: drv-id 2, tcs-config ACTIVE 2 / SLEEP 3 / WAKE 3 / CONTROL 1, reg 0x179e0000 (+0x100) and 0x179e0d00
+  (+0x3000): same geometry as sweet, so sweet_rpmh.c ports with only the base addresses and the resource name changed.
