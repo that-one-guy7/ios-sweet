@@ -507,3 +507,9 @@ What it took today (in order): 0058 HID services (Apple IOHIDFamily-1915 user cl
 - Plain read and `0x80` register read return zeros: not the stmfts command set. Stock driver: ST FTS5 lib 5.2.4 (events 8 bytes;
   `0x85` read one, `0x86` read all; HW register read `0xFA` + 4-byte address; scan mode `0xA0`), per memory, unverified.
 - For the XNU driver: enable gpio23 (south tile) -> reset pulse (gpio32) -> bit-bang gpio33/34 -> poll events; no clocks, no SE.
+
+### Mi 8 touch v9 result (2026-10-28): protocol confirmed, sensing off
+
+- `CHIPID` block = `36 39 03 00 54 00 39 19` (chip id 0x3936, FW 0x0054, SVN 0x1939: matches dmesg `FW VER = 0054`, `SVN REV = 1939`).
+  `BOOTEV` = `03 00 00 00 ...` controller ready; gpio31 low right after reset, no events or irq while touching.
+- v10 tries `A0 00 FF`, `A0 00 01`, `93` (sense on) to start scanning.

@@ -82,7 +82,7 @@ static uint32_t pcfg[160], pout[160];
 
 /* --- I2C slave model on SDA = gpio33, SCL = gpio34: FTS-like device at 0x49, reg 0x80 returns 36 01 02 03 ... --- */
 enum { S_IDLE, S_ADDR, S_ACKA, S_WR, S_ACKW, S_RD, S_MACK, S_IGN };
-static int st = S_IDLE, bits, rw, slave_low, regptr = -1, rdi, expect_reg, mack, ncmd, cmd0, ev_calls;
+static int st = S_IDLE, bits, rw, slave_low, regptr = -1, rdi, expect_reg, mack, ncmd, cmd0, ev_calls, sense_on;
 static unsigned char evbuf[8];
 static unsigned shift;
 static int last_sda = 1, last_scl = 1;
@@ -102,7 +102,7 @@ static void prep_read(void)
 	if (cmd0 == 0x85 || cmd0 == 0x86) {
 		ev_calls++;
 		if (ev_calls == 1) { evbuf[0] = 0x03; evbuf[1] = 0x01; }	/* controller ready */
-		if (ev_calls >= 5 && ev_calls <= 7) {				/* a touch at x=0x123 y=0x456 */
+		if (sense_on && ev_calls >= 3 && (ev_calls % 4) == 0) {		/* a touch at x=0x123 y=0x456, only once sensing was enabled */
 			unsigned char t[8] = { 0x13, 0x01, 0x23, 0x61, 0x45, 0x10, 0, 0 };
 			memcpy(evbuf, t, 8);
 		}
@@ -114,7 +114,11 @@ static void slave_step(void)
 	int sda = line_sda(), scl = line_scl();
 
 	if (scl && last_scl && last_sda && !sda) { st = S_ADDR; bits = 0; shift = 0; expect_reg = 1; }	/* START */
-	else if (scl && last_scl && !last_sda && sda) { st = S_IDLE; slave_low = 0; }				/* STOP */
+	else if (scl && last_scl && !last_sda && sda) {
+		if ((st == S_WR || st == S_ACKW) && ncmd == 3 && cmd0 == 0xA0) sense_on = 1;	/* scan mode command */
+		if ((st == S_WR || st == S_ACKW) && ncmd == 1 && cmd0 == 0x93) sense_on = 1;
+		st = S_IDLE; slave_low = 0;
+	}				/* STOP */
 	else if (scl && !last_scl) {										/* rising */
 		if (st == S_ADDR || st == S_WR) { shift = (shift << 1) | (unsigned)sda; bits++; }
 		else if (st == S_MACK) mack = !sda;
@@ -215,7 +219,7 @@ int main(void)
 	mi8_touch_probe();
 	if (getenv("DEBUG_DUMP")) { uint32_t sz; memcpy(&sz, ram[0] + 8, 4); fwrite(ram[0] + 12, 1, sz, stdout); }
 	rh_fake_init();
-	bad += check_zone(ram[0], "TOUCH mi8 touch v9: fts events");
+	bad += check_zone(ram[0], "TOUCH mi8 touch v10: fts scan mode");
 	bad += check_zone(ram[0], "V23 hi=00000001 lo=00000000");
 	bad += check_zone(ram[0], "VDDIO1 ok=00000001");
 	bad += check_zone(ram[0], "IDLE sda=00000001 scl=00000001");
@@ -224,6 +228,7 @@ int main(void)
 	bad += check_zone(ram[0], "BOOTEV rc=00000000 b0-3=00000103");
 	bad += check_zone(ram[0], "EVT0 b0-3=61230113 b4-7=00001045");
 	bad += check_zone(ram[0], "XY x=00000123 y=00000456");
+	bad += check_zone(ram[0], "PH0 rc=00000000");
 	/* no active pipe */
 	regs_sspp0_active = 0; renders = 0; mdp_writes = 0; con_fb = 0; con_stride4 = 1080;
 	mi8_diag(0);

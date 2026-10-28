@@ -595,7 +595,7 @@ static uint32_t le32(const uint8_t *b)
 
 #define FTS_ADDR	0x49
 #define EV_LINES	5
-static int ev_i = -1, xy_i = -1;
+static int ev_i = -1, xy_i = -1, ph_i = -1;
 
 /* STM FTS5 event: 8 bytes. id 0x13 enter / 0x23 motion / 0x33 leave (touch), 0x03 controller ready, 0x00 none.
  * Position as in ST's fts5 driver (unverified for this chip): x = (b3 & 0x0f) << 8 | b2, y = b4 << 4 | b3 >> 4. */
@@ -624,8 +624,8 @@ void mi8_touch_probe(void)
 
 	nl = 0;
 	tick_i = -1;
-	ev_i = xy_i = -1;
-	msg("TOUCH", "mi8 touch v9: fts events");
+	ev_i = xy_i = ph_i = -1;
+	msg("TOUCH", "mi8 touch v10: fts scan mode");
 	pair("PIN", 1, "cfg=", rd32(pin_cfg(31)), "io=", rd32(pin_cfg(31) + 4));
 	/* touch rails: vdd = disp_vddio_vreg (gpio23); avdd (pm8998_l28) was already on in v8 (chip ACKed before the vote) */
 	pair("VDDIO", 1, "ok=", (uint32_t)vddio_enable(), 0, 0);
@@ -665,31 +665,48 @@ void mi8_touch_probe(void)
 	pair("POLLS", -1, "n=", 0, "irqlow=", 0);
 	flush_log();
 
-	/* 50 s of polling: read one event (cmd 0x85) every 20 ms while the irq line is low, else every 200 ms.
-	 * Touch the screen. The list shows the last five non-empty events. */
-	for (unsigned t = 0; t < 2500; t++) {
-		int pending = !line_get(31);
+	/* The chip boots with sensing off: the stock driver sends "scan mode active" (0xA0, 0x00, 0xFF, per memory of the ST fts5
+	 * library). Three attempts of 15 s each, touch the screen throughout; PHn shows which one produced events.
+	 *   0: A0 00 FF   1: A0 00 01   2: 93 (older ST FTS "MS_MT_SENSE_ON") */
+	ph_i = nl;
+	for (int k = 0; k < 3; k++)
+		pair("PH", k, "rc=", 0, "ev=", 0);
+	for (unsigned phase = 0; phase < 3; phase++) {
+		uint8_t cmd[3];
+		unsigned ncmd, before = events;
 
-		if (pending)
-			irq_low++;
-		if (pending || (t % 10) == 0) {
-			w[0] = 0x85;
-			memset_b(ev, 0, sizeof(ev));
-			polls++;
-			if (!bb_xfer(FTS_ADDR, w, 1, ev, 8) && ev[0]) {
-				events++;
-				fts_show_event(ev, events);
+		cmd[0] = phase == 2 ? 0x93 : 0xa0;
+		cmd[1] = 0x00;
+		cmd[2] = phase == 0 ? 0xff : 0x01;
+		ncmd = phase == 2 ? 1 : 3;
+		rc = bb_xfer(FTS_ADDR, cmd, ncmd, 0, 0);
+		L[ph_i + (int)phase].av = (uint32_t)rc;
+		delay_ms(50);
+		for (unsigned t = 0; t < 750; t++) {
+			int pending = !line_get(31);
+
+			if (pending)
+				irq_low++;
+			if (pending || (t % 10) == 0) {
+				w[0] = 0x85;
+				memset_b(ev, 0, sizeof(ev));
+				polls++;
+				if (!bb_xfer(FTS_ADDR, w, 1, ev, 8) && ev[0]) {
+					events++;
+					fts_show_event(ev, events);
+				}
 			}
+			if ((t % 50) == 49) {
+				L[ph_i + (int)phase].bv = events - before;
+				L[xy_i + 2].av = polls;
+				L[xy_i + 2].bv = irq_low;
+				render(C_BLUE, "touch v10: TOUCH THE SCREEN");
+				flush_log();
+			}
+			delay_ms(20);
 		}
-		if ((t % 50) == 49) {
-			L[xy_i + 2].av = polls;
-			L[xy_i + 2].bv = irq_low;
-			render(C_BLUE, "touch v9: TOUCH THE SCREEN");
-			flush_log();
-		}
-		delay_ms(20);
 	}
-	render(C_GREEN, "touch v9: done, rebooting");
+	render(C_GREEN, "touch v10: done, rebooting");
 	flush_log();
 	delay_ms(15000);
 }

@@ -1,15 +1,12 @@
 # Mi 8 (dipper, SDM845) bring-up
 
-**Touch probe (shim v9: FTS events):** v8 on a real phone: gpio23 (the enable of `disp_vddio_vreg`, the touch vdd) is in the
-*south* tile (`TILE1` p23 cfg 0x203, neighbours 0x1); driving it high freed the bus (`IDLE sda=1 scl=1`) and the FTS chip
-**ACKs at 0x49** with SDA = gpio33, SCL = gpio34 (the swapped order and 0x4a NACK). It already ACKed before the pm8998_l28 vote,
-so avdd was on; the RPMh code is kept behind `-DMI8_RPMH`. The plain read and register 0x80 returned zeros: wrong commands for
-this chip generation (dmesg: `fts_probe: driver ver: 5.2.4`, FW 0054, fw `st_fts_e1.ftb`, i.e. the ST FTS5 library). v9 enables
-vddio, pulses reset, then reads the FTS5 chip id (`0xFA` + address 0x20000000, `CHIPID`), the event FIFO (`0x86`, `BOOTEV`:
-expect a controller-ready event `0x03`), and polls `0x85` for 50 s while you touch the screen: `EVT0..4` are the last
-non-empty 8-byte events (`0x13` enter, `0x23` motion, `0x33` leave), `XY` the decoded position (ST fts5 layout, unverified),
-`POLLS n/irqlow` how often it read and how often gpio31 (irq) was low. Resets to Android afterwards. The host test drives it
-against an FTS-like slave model.
+**Touch probe (shim v10: FTS scan mode):** v9 on a real phone: the FTS5 commands work. `CHIPID` (0xFA + 0x20000000) returned
+`36 39 03 00 54 00 39 19`: chip id 0x3936, FW 0x0054, SVN 0x1939 (dmesg: FW VER 0054, SVN REV 1939). `BOOTEV` (0x86) returned
+`03 00 ...` (controller ready), gpio31 was low after reset (event pending). Touching changed nothing and the irq line never
+fell: the chip boots with sensing off. v10 sends the scan-mode commands the stock driver uses, three attempts of 15 s
+(`PH0` A0 00 FF, `PH1` A0 00 01, `PH2` 93), polling 0x85 and showing `PHn rc= ev=` (rc 0 = ACKed, ev = events seen in that
+phase), the last five events `EVT0..4` and the decoded `XY`. Touch the screen throughout (about 50 s); the last screen is
+green and stays up 15 s: photograph that one.
 
 **Boot 1 result (2026-10-25):** kernel text on screen up to `zone_init`, then frozen on both images. Cause found in the
 patches: the boot-CPU driver (0018) and AppleKeyStore (0038) match `IONameMatch qcom,kryo470`, and mkadt had replaced it
