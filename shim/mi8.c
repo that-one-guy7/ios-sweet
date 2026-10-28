@@ -510,296 +510,6 @@ static uint8_t bb_rbyte(int ack)
 	return v;
 }
 
-/* 0 ok (ACK), 1 NACK at the address, 2 bus/clock stuck. Reads n bytes after writing the register pointer if reg >= 0. */
-static int bb_read(uint8_t addr, int reg, uint8_t *buf, unsigned n)
-{
-	int a;
-
-	if (bb_start())
-		return 2;
-	/* plain read: address with the R bit; register read: address with W, register, repeated start, address with R */
-	a = bb_wbyte((uint8_t)((addr << 1) | (reg < 0 ? 1U : 0U)));
-	if (a) {
-		bb_stop();
-		return a;
-	}
-	if (reg >= 0) {
-		a = bb_wbyte((uint8_t)reg);
-		if (a) {
-			bb_stop();
-			return a == 2 ? 2 : 1;
-		}
-		line_rel(bb_sda);
-		delay_us(5);
-		if (bb_start()) {
-			bb_stop();
-			return 2;
-		}
-		a = bb_wbyte((uint8_t)((addr << 1) | 1));
-		if (a) {
-			bb_stop();
-			return a == 2 ? 2 : 1;
-		}
-	}
-	for (unsigned i = 0; i < n; i++)
-		buf[i] = bb_rbyte(i + 1 < n);
-	bb_stop();
-	return 0;
-}
-
-/* ---- RPMh client for ONE resource (port of sweet_rpmh.c, SM7150 -> SDM845) ----
- * apps_rsc DRV2 @ 0x179e0000, TCS bank @ 0x179e0d00 (DT: qcom,drv-id 2, tcs-config ACTIVE 2 / SLEEP 3 / WAKE 3 / CONTROL 1,
- * same layout as sweet). cmd-db locator 0x0c3f000c as on sweet; the db itself is at 0x85fe0000 on this phone.
- * Used for pm8998_l28 ("ldoa28", pmic4-ldo, the touch avdd rail): voltage, mode HPM, enable, ACTIVE set only.
- * Conservative like the original: refuses on any unexpected register state, never retries. */
-#define RH_RSC		0x179e0000UL
-#define RH_TCS		0x179e0d00UL
-#define RH_DICT		0x0c3f000cUL
-#define RH_DRV		2U
-#define RH_TCS_SIZE	0x3000U
-#define RH_ACTIVE_N	2U
-#define RH_NORMAL_N	8U
-#define RH_STRIDE	0x2a0U
-#define RH_CMDSTR	0x14U
-#define RH_IRQ_EN	0x00U
-#define RH_IRQ_ST	0x04U
-#define RH_IRQ_CLR	0x08U
-#define RH_WAIT		0x10U
-#define RH_CONTROL	0x14U
-#define RH_STATUS	0x18U
-#define RH_ENABLE	0x1cU
-#define RH_MSGID	0x30U
-#define RH_ADDR		0x34U
-#define RH_DATA		0x38U
-#define RH_CMDST	0x3cU
-#define RH_AMC_EN	(1U << 16)
-#define RH_TRIGGER	(1U << 24)
-#define RH_ISSUED	(1U << 8)
-#define RH_COMPLETE	(1U << 16)
-#define RH_WRITE_ACK	(8U | (1U << 8) | (1U << 16))
-#define RH_DB_MAGIC	0x0c0330dbU
-#define RH_DB_HEADER	144U
-#define RH_DB_ENTRY	24U
-#define RH_VRM		4U
-
-static uintptr_t rh_db;
-static uint32_t rh_db_size;
-static unsigned rh_ncpt;
-
-static void rh_w(uint32_t off, uint32_t v)
-{
-	wr32(RH_TCS + off, v);
-	dsb();
-}
-
-static int rh_sync(uint32_t off, uint32_t v)
-{
-	rh_w(off, v);
-	for (unsigned i = 0; i < 1000; i++) {
-		if (rd32(RH_TCS + off) == v)
-			return 1;
-		delay_us(1);
-	}
-	return 0;
-}
-
-static unsigned rh_db16(uint32_t off)
-{
-	return (unsigned)((rd32(rh_db + (off & ~3U)) >> (8U * (off & 3U))) & 0xffffU);
-}
-
-static int rh_range(uint32_t off, uint32_t size)
-{
-	return off <= rh_db_size && size <= rh_db_size - off;
-}
-
-/* 0 ok, 1 RSC geometry/revision unsupported, 2 cmd-db locator, 3 cmd-db header */
-static int rh_map(void)
-{
-	uint32_t id = rd32(RH_RSC), solver = rd32(RH_RSC + 4), config = rd32(RH_RSC + 0x0c);
-	unsigned major = (id >> 16) & 0xffU, count = (config >> (6U * RH_DRV)) & 0x3fU;
-	uint32_t pa, size;
-
-	rh_ncpt = (config >> 27) & 0x1fU;
-	pair("RSC", -1, "id=", id, "cfg=", config);
-	if ((major != 1 && major != 2) || config == 0xffffffffU || solver == 0xffffffffU || count < RH_NORMAL_N ||
-	    count > RH_TCS_SIZE / RH_STRIDE || rh_ncpt < 3 || rh_ncpt > 16)
-		return 1;
-	pa = rd32(RH_DICT);
-	size = rd32(RH_DICT + 4);
-	pair("CMDDB", -1, "pa=", pa, "size=", size);
-	if (pa < 0x80000000U || (pa & 3U) || (size & 3U) || size < RH_DB_HEADER || size > 0x100000U ||
-	    (uint64_t)pa + size > 0x100000000ULL)
-		return 2;
-	rh_db = pa;
-	rh_db_size = size;
-	pair(" ", -1, "ver=", rd32(rh_db), "magic=", rd32(rh_db + 4));
-	if (rd32(rh_db + 4) != RH_DB_MAGIC || rd32(rh_db) != 1U || (rd32(rh_db + 140) & 1U))
-		return 3;
-	return 0;
-}
-
-/* resource name "ldoa28": 0 ok (address in *address), 4 malformed db, 5 not exactly one match / bad VRM entry */
-static int rh_lookup(uint32_t k0, uint32_t k1, uint32_t *address)
-{
-	unsigned matches = 0;
-
-	for (unsigned i = 0; i < 8; i++) {
-		uint32_t h = 8U + 16U * i;
-		unsigned slave = rh_db16(h);
-		uint32_t entries, aux;
-		unsigned count;
-
-		if (!slave)
-			break;
-		entries = RH_DB_HEADER + rh_db16(h + 2);
-		aux = RH_DB_HEADER + rh_db16(h + 4);
-		count = rh_db16(h + 6);
-		if (slave < 3 || slave > 5 || (entries & 3U) || !rh_range(entries, count * RH_DB_ENTRY) || !rh_range(aux, 0))
-			return 4;
-		for (unsigned j = 0; j < count; j++) {
-			uint32_t e = entries + RH_DB_ENTRY * j, addr;
-
-			if (rd32(rh_db + e) != k0 || rd32(rh_db + e + 4) != k1)
-				continue;
-			addr = rd32(rh_db + e + 16);
-			if (slave != RH_VRM || (addr >> 16) != RH_VRM || (addr & 15U) ||
-			    !rh_range(aux + rh_db16(e + 22), rh_db16(e + 20)))
-				return 5;
-			*address = addr;
-			matches++;
-		}
-	}
-	return matches == 1 ? 0 : 5;
-}
-
-static int rh_free(unsigned t)
-{
-	uint32_t b = t * RH_STRIDE;
-
-	return rd32(RH_TCS + b + RH_STATUS) != 0 && rd32(RH_TCS + b + RH_STATUS) != 0xffffffffU &&
-	       rd32(RH_TCS + b + RH_CONTROL) == 0 && rd32(RH_TCS + b + RH_ENABLE) == 0 &&
-	       rd32(RH_TCS + b + RH_WAIT) == 0 && !(rd32(RH_TCS + RH_IRQ_ST) & (1U << t));
-}
-
-/* 0 ok, 6 inherited state/conflict/no free ACTIVE TCS, 7 register readback, 8 vote timeout (TCS left quarantined) */
-static int rh_send(uint32_t address, unsigned mv)
-{
-	static const uint32_t offsets[3] = { 0, 8, 4 };	/* voltage, mode, enable (enable last) */
-	uint32_t values[3];
-	int chosen = -1;
-	uint32_t irq_en, b, bit;
-	unsigned t;
-
-	values[0] = mv;
-	values[1] = 7;	/* HPM */
-	values[2] = 1;
-	for (unsigned i = 0; i < RH_ACTIVE_N; i++) {
-		uint32_t bb = i * RH_STRIDE, enabled = rd32(RH_TCS + bb + RH_ENABLE);
-
-		if (enabled & ~((1U << rh_ncpt) - 1U))
-			return 6;
-		for (unsigned c = 0; c < rh_ncpt; c++)
-			if ((enabled & (1U << c)) && (rd32(RH_TCS + bb + RH_ADDR + c * RH_CMDSTR) & ~15U) == address)
-				return 6;
-		if (chosen < 0 && rh_free(i))
-			chosen = (int)i;
-	}
-	if (chosen < 0)
-		return 6;
-	t = (unsigned)chosen;
-	b = t * RH_STRIDE;
-	bit = 1U << t;
-	irq_en = rd32(RH_TCS + RH_IRQ_EN);
-	if (irq_en == 0xffffffffU || !rh_free(t))
-		return 6;
-	if (!rh_sync(RH_IRQ_EN, irq_en & ~bit))
-		return 7;
-	if (!rh_free(t)) {
-		rh_sync(RH_IRQ_EN, (rd32(RH_TCS + RH_IRQ_EN) & ~bit) | (irq_en & bit));
-		return 6;
-	}
-	for (unsigned c = 0; c < 3; c++) {
-		uint32_t cmd = b + c * RH_CMDSTR;
-
-		if (!rh_sync(cmd + RH_MSGID, RH_WRITE_ACK) || !rh_sync(cmd + RH_ADDR, address + offsets[c]) ||
-		    !rh_sync(cmd + RH_DATA, values[c]))
-			return 7;
-	}
-	if (!rh_sync(b + RH_WAIT, 7) || !rh_sync(b + RH_ENABLE, 7) || !rh_sync(b + RH_CONTROL, 0) ||
-	    !rh_sync(b + RH_CONTROL, RH_AMC_EN))
-		return 7;
-	rh_w(b + RH_CONTROL, RH_AMC_EN | RH_TRIGGER);
-	{
-		int done = 0, progress = 0;
-		uint32_t irq = 0, idle = 0, st[3] = { 0, 0, 0 };
-
-		for (unsigned us = 0; us < 100000U; us++) {
-			int complete = 1;
-
-			irq = rd32(RH_TCS + RH_IRQ_ST);
-			idle = rd32(RH_TCS + b + RH_STATUS);
-			for (unsigned c = 0; c < 3; c++) {
-				st[c] = rd32(RH_TCS + b + RH_CMDST + c * RH_CMDSTR);
-				complete &= st[c] != 0xffffffffU && (st[c] & (RH_ISSUED | RH_COMPLETE)) == (RH_ISSUED | RH_COMPLETE);
-			}
-			progress |= idle == 0 || !complete;
-			if (idle && idle != 0xffffffffU && irq != 0xffffffffU && ((irq & bit) || progress) && complete) {
-				done = 1;
-				break;
-			}
-			delay_us(1);
-		}
-		pair("RHTCS", (int)t, "idle=", idle, "irq=", irq);
-		pair(" ", -1, "st0=", st[0], "st1=", st[1]);
-		if (!done)
-			return 8;
-	}
-	if (!rh_sync(b + RH_CONTROL, RH_AMC_EN) || !rh_sync(b + RH_CONTROL, 0) || !rh_sync(b + RH_ENABLE, 0) ||
-	    !rh_sync(b + RH_WAIT, 0))
-		return 7;
-	rh_w(RH_IRQ_CLR, bit);	/* write-1-to-clear: only our TCS */
-	if ((rd32(RH_TCS + RH_IRQ_ST) & bit) || !rh_sync(RH_IRQ_EN, (rd32(RH_TCS + RH_IRQ_EN) & ~bit) | (irq_en & bit)))
-		return 7;
-	return 0;
-}
-
-/* pm8998_l28 "ldoa28" at 3.3 V; returns 0 on success, otherwise a code (see the helpers above) */
-static int rh_enable_l28(void)
-{
-	uint32_t address = 0;
-	int rc = rh_map();
-
-	if (!rc)
-		rc = rh_lookup(0x616f646cU, 0x00003832U, &address);	/* "ldoa28\0\0" */
-	if (!rc) {
-		pair("L28", -1, "addr=", address, 0, 0);
-		rc = rh_send(address, 3300);
-	}
-	return rc;
-}
-
-/* does the pin follow what we drive? (proves TLMM writes and the input path work) */
-static void pin_selftest(unsigned pin, int idx)
-{
-	uintptr_t off = pin_cfg(pin);
-	uint32_t hi, lo, rel;
-
-	touch_gpio(pin, 0, 3, 1, 0);
-	rel = rd32(off + 4) & 1U;
-	wr32(off + 4, rd32(off + 4) | 2U);
-	wr32(off, rd32(off) | 0x200U);	/* output high */
-	delay_us(50);
-	hi = rd32(off + 4) & 1U;
-	wr32(off + 4, rd32(off + 4) & ~2U);	/* output low */
-	delay_us(50);
-	lo = rd32(off + 4) & 1U;
-	wr32(off, rd32(off) & ~0x200U);	/* release */
-	delay_us(50);
-	pair("SELF", idx, "hi=", hi, "lo=", lo);
-	pair(" ", -1, "rel=", rel, "cfg=", rd32(off));
-}
-
 /* TLMM tiles on this SoC family: north 0x3900000 (holds gpio31-34), south 0x3d00000, west 0x3500000. The right tile for a
  * pin is the one where its neighbours read non-zero (an unmapped tile reads 0). */
 static uintptr_t find_pin(unsigned pin)
@@ -845,85 +555,143 @@ static int vddio_enable(void)
 	return 0;
 }
 
-static void idle_levels(int stage)
+/* write nw bytes (may be 0), then if nr: repeated start + read nr bytes. 0 ok, 1 NACK, 2 stuck */
+static int bb_xfer(uint8_t addr, const uint8_t *w, unsigned nw, uint8_t *r, unsigned nr)
 {
-	for (unsigned order = 0; order < 2; order++) {
-		unsigned sda = order ? 34 : 33, scl = order ? 33 : 34;
+	int a;
 
-		bb_setup(sda, scl);
-		pair("IDLE", (int)(order + stage * 2), "sda=", (uint32_t)line_get(sda), "scl=", (uint32_t)line_get(scl));
+	if (bb_start())
+		return 2;
+	a = bb_wbyte((uint8_t)(addr << 1));
+	for (unsigned i = 0; !a && i < nw; i++)
+		a = bb_wbyte(w[i]);
+	if (a) {
+		bb_stop();
+		return a == 2 ? 2 : 1;
 	}
+	if (nr) {
+		line_rel(bb_sda);
+		delay_us(5);
+		if (bb_start()) {
+			bb_stop();
+			return 2;
+		}
+		a = bb_wbyte((uint8_t)((addr << 1) | 1));
+		if (a) {
+			bb_stop();
+			return a == 2 ? 2 : 1;
+		}
+		for (unsigned i = 0; i < nr; i++)
+			r[i] = bb_rbyte(i + 1 < nr);
+	}
+	bb_stop();
+	return 0;
 }
 
-static void bb_scan(int stage)
+static uint32_t le32(const uint8_t *b)
 {
-	uint8_t b[8];
+	return (uint32_t)b[0] | ((uint32_t)b[1] << 8) | ((uint32_t)b[2] << 16) | ((uint32_t)b[3] << 24);
+}
 
-	for (unsigned order = 0; order < 2; order++) {
-		unsigned sda = order ? 34 : 33, scl = order ? 33 : 34;
-		int rc;
+#define FTS_ADDR	0x49
+#define EV_LINES	5
+static int ev_i = -1, xy_i = -1;
 
-		bb_setup(sda, scl);
-		pair("BBPINS", (int)(order + stage * 2), "sda=", sda, "idle=", (uint32_t)(line_get(sda) | (line_get(scl) << 1)));
-		memset_b(b, 0, sizeof(b));
-		rc = bb_read(0x49, -1, b, 1);
-		pair("I2C49", (int)(order + stage * 2), "rc=", (uint32_t)rc, "byte=", b[0]);
-		memset_b(b, 0, sizeof(b));
-		rc = bb_read(0x4a, -1, b, 1);
-		pair("I2C4A", (int)(order + stage * 2), "rc=", (uint32_t)rc, "byte=", b[0]);
-		memset_b(b, 0, sizeof(b));
-		rc = bb_read(0x49, 0x80, b, 8);	/* ST FTS READ_INFO (stmfts): meaningful only if the chip answered */
-		pair("INFO", (int)(order + stage * 2), "rc=", (uint32_t)rc,
-		     "b0-3=", (uint32_t)b[0] | ((uint32_t)b[1] << 8) | ((uint32_t)b[2] << 16) | ((uint32_t)b[3] << 24));
-		flush_log();
+/* STM FTS5 event: 8 bytes. id 0x13 enter / 0x23 motion / 0x33 leave (touch), 0x03 controller ready, 0x00 none.
+ * Position as in ST's fts5 driver (unverified for this chip): x = (b3 & 0x0f) << 8 | b2, y = b4 << 4 | b3 >> 4. */
+static void fts_show_event(const uint8_t *e, unsigned n)
+{
+	if (ev_i < 0)
+		return;
+	for (int k = EV_LINES - 1; k > 0; k--) {
+		L[ev_i + k].av = L[ev_i + k - 1].av;
+		L[ev_i + k].bv = L[ev_i + k - 1].bv;
 	}
+	L[ev_i].av = le32(e);
+	L[ev_i].bv = le32(e + 4);
+	if (xy_i >= 0 && (e[0] == 0x13 || e[0] == 0x23 || e[0] == 0x33)) {
+		L[xy_i].av = ((uint32_t)(e[3] & 0x0fU) << 8) | e[2];
+		L[xy_i].bv = ((uint32_t)e[4] << 4) | (e[3] >> 4);
+	}
+	L[xy_i + 1].av = n;
 }
 
 void mi8_touch_probe(void)
 {
+	uint8_t w[5], r[8], ev[8];
 	int rc;
+	unsigned irq_low = 0, polls = 0, events = 0;
 
 	nl = 0;
 	tick_i = -1;
-	msg("TOUCH", "mi8 touch v8: vddio + avdd + gpio i2c");
-	for (unsigned p = 31; p <= 34; p++)
-		pair("PIN", (int)(p - 30), "cfg=", rd32(pin_cfg(p)), "io=", rd32(pin_cfg(p) + 4));
-	flush_log();
-
-	/* release the touch pins like sweet: irq = input pull-up, reset = output high */
+	ev_i = xy_i = -1;
+	msg("TOUCH", "mi8 touch v9: fts events");
+	pair("PIN", 1, "cfg=", rd32(pin_cfg(31)), "io=", rd32(pin_cfg(31) + 4));
+	/* touch rails: vdd = disp_vddio_vreg (gpio23); avdd (pm8998_l28) was already on in v8 (chip ACKed before the vote) */
+	pair("VDDIO", 1, "ok=", (uint32_t)vddio_enable(), 0, 0);
+	/* release the touch pins like sweet: irq input pull-up, reset output high; then a reset pulse and wait for boot */
 	touch_gpio(31, 0, 3, 3, 0);
 	touch_gpio(32, 0, 3, 3, 1);
+	bb_setup(33, 34);
+	delay_ms(20);
+	wr32(pin_cfg(32) + 4, rd32(pin_cfg(32) + 4) & ~2U);	/* reset low */
+	delay_ms(10);
+	wr32(pin_cfg(32) + 4, rd32(pin_cfg(32) + 4) | 2U);	/* reset high */
 	delay_ms(300);
-	pin_selftest(33, 0);
-	pin_selftest(34, 1);
+	pair("IDLE", -1, "sda=", (uint32_t)line_get(33), "scl=", (uint32_t)line_get(34));
+	pair("IRQ", -1, "gpio31=", (uint32_t)line_get(31), 0, 0);
 	flush_log();
 
-	pair("VDDIO", 1, "ok=", (uint32_t)vddio_enable(), 0, 0);	/* touch vdd: disp_vddio_vreg, gpio23 */
-	idle_levels(0);
+	rc = bb_xfer(FTS_ADDR, 0, 0, 0, 0);
+	pair("ACK49", -1, "rc=", (uint32_t)rc, 0, 0);
+	/* hardware register 0x20000000 (chip id) through the FTS5 "HW reg read" command 0xFA + 4-byte address */
+	w[0] = 0xfa; w[1] = 0x20; w[2] = 0x00; w[3] = 0x00; w[4] = 0x00;
+	memset_b(r, 0, sizeof(r));
+	rc = bb_xfer(FTS_ADDR, w, 5, r, 8);
+	pair("CHIPID", -1, "rc=", (uint32_t)rc, "b0-3=", le32(r));
+	pair(" ", -1, "b4-7=", le32(r + 4), 0, 0);
+	/* event FIFO: 0x86 = read all (first 8 bytes), expect "controller ready" 0x03.. after the reset */
+	w[0] = 0x86;
+	memset_b(ev, 0, sizeof(ev));
+	rc = bb_xfer(FTS_ADDR, w, 1, ev, 8);
+	pair("BOOTEV", -1, "rc=", (uint32_t)rc, "b0-3=", le32(ev));
+	pair(" ", -1, "b4-7=", le32(ev + 4), 0, 0);
+	ev_i = nl;
+	for (int k = 0; k < EV_LINES; k++)
+		pair("EVT", k, "b0-3=", 0, "b4-7=", 0);
+	xy_i = nl;
+	pair("XY", -1, "x=", 0, "y=", 0);
+	pair(" ", -1, "events=", 0, 0, 0);
+	pair("POLLS", -1, "n=", 0, "irqlow=", 0);
 	flush_log();
-	bb_scan(0);	/* vddio only */
-	render(C_BLUE, "touch v8 1/2: vddio on, no avdd vote");
-	delay_ms(8000);
 
-	/* pm8998_l28 (touch avdd) through RPMh, then a reset pulse so the chip boots with power present */
-	rc = rh_enable_l28();
-	pair("RAIL", -1, "rc=", (uint32_t)rc, 0, 0);
-	flush_log();
-	if (!rc) {
+	/* 50 s of polling: read one event (cmd 0x85) every 20 ms while the irq line is low, else every 200 ms.
+	 * Touch the screen. The list shows the last five non-empty events. */
+	for (unsigned t = 0; t < 2500; t++) {
+		int pending = !line_get(31);
+
+		if (pending)
+			irq_low++;
+		if (pending || (t % 10) == 0) {
+			w[0] = 0x85;
+			memset_b(ev, 0, sizeof(ev));
+			polls++;
+			if (!bb_xfer(FTS_ADDR, w, 1, ev, 8) && ev[0]) {
+				events++;
+				fts_show_event(ev, events);
+			}
+		}
+		if ((t % 50) == 49) {
+			L[xy_i + 2].av = polls;
+			L[xy_i + 2].bv = irq_low;
+			render(C_BLUE, "touch v9: TOUCH THE SCREEN");
+			flush_log();
+		}
 		delay_ms(20);
-		touch_gpio(32, 0, 3, 3, 1);
-		wr32(pin_cfg(32) + 4, rd32(pin_cfg(32) + 4) & ~2U);	/* reset low */
-		delay_ms(10);
-		wr32(pin_cfg(32) + 4, rd32(pin_cfg(32) + 4) | 2U);	/* reset high */
-		delay_ms(400);
-		idle_levels(1);
-		bb_scan(1);
 	}
-	pair("LEGEND", -1, "rc 0=ack", 0, "1=nack", 0);
-	pair(" ", -1, "2=stuck", 0, "RAIL 0=ok", 0);
+	render(C_GREEN, "touch v9: done, rebooting");
 	flush_log();
-	render(C_GREEN, "touch v8 2/2: after avdd vote");
-	delay_ms(120000);
+	delay_ms(15000);
 }
 
 void mi8_panic_log(const char *stage, uint64_t slot, uint64_t esr, uint64_t elr, uint64_t far)

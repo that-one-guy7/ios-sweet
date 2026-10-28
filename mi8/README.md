@@ -1,13 +1,15 @@
 # Mi 8 (dipper, SDM845) bring-up
 
-**Touch probe (shim v8: vddio + avdd + GPIO bit-bang I2C):** the touch bus (global SE14, gpio33/34) is bit-banged because the SE is
-GSI-only. v7 on a real phone: pin writes work (`SELF hi=1 lo=0`), the bus reads low even released (`rel=0`), the RPMh vote for
-pm8998_l28 worked (`RAIL rc=0`, TCS completed, `L28 addr=0x42100`) yet the bus stayed low, and gpio23 (the enable of
-`disp_vddio_vreg`, the touch vdd) read cfg 0 / io 0, i.e. not driven: the touch chip's I/O supply is most likely off and its
-pins clamp the bus. v8 finds gpio23's tile (the one whose neighbours read non-zero), drives it high only if the pin answers,
-waits 10 ms, reports bus idle levels (`IDLE n sda= scl=`, 1/1 = free), scans, then votes L28, pulses reset and scans again.
-`V23 hi=1 lo=0` = pin answered; `TILE` lines show what each tile reads for gpio22/23/24. `RAIL rc` and `I2C49n rc` as before
-(0 ack, 1 nack, 2 stuck).
+**Touch probe (shim v9: FTS events):** v8 on a real phone: gpio23 (the enable of `disp_vddio_vreg`, the touch vdd) is in the
+*south* tile (`TILE1` p23 cfg 0x203, neighbours 0x1); driving it high freed the bus (`IDLE sda=1 scl=1`) and the FTS chip
+**ACKs at 0x49** with SDA = gpio33, SCL = gpio34 (the swapped order and 0x4a NACK). It already ACKed before the pm8998_l28 vote,
+so avdd was on; the RPMh code is kept behind `-DMI8_RPMH`. The plain read and register 0x80 returned zeros: wrong commands for
+this chip generation (dmesg: `fts_probe: driver ver: 5.2.4`, FW 0054, fw `st_fts_e1.ftb`, i.e. the ST FTS5 library). v9 enables
+vddio, pulses reset, then reads the FTS5 chip id (`0xFA` + address 0x20000000, `CHIPID`), the event FIFO (`0x86`, `BOOTEV`:
+expect a controller-ready event `0x03`), and polls `0x85` for 50 s while you touch the screen: `EVT0..4` are the last
+non-empty 8-byte events (`0x13` enter, `0x23` motion, `0x33` leave), `XY` the decoded position (ST fts5 layout, unverified),
+`POLLS n/irqlow` how often it read and how often gpio31 (irq) was low. Resets to Android afterwards. The host test drives it
+against an FTS-like slave model.
 
 **Boot 1 result (2026-10-25):** kernel text on screen up to `zone_init`, then frozen on both images. Cause found in the
 patches: the boot-CPU driver (0018) and AppleKeyStore (0038) match `IONameMatch qcom,kryo470`, and mkadt had replaced it

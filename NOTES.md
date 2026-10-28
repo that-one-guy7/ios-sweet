@@ -491,3 +491,19 @@ What it took today (in order): 0058 HID services (Apple IOHIDFamily-1915 user cl
 - vdd = `disp_vddio_vreg`: regulator-fixed, GPIO23 active-high enable, boot-on (the panel needs it, so it is on).
 - RSC `apps_rsc`: drv-id 2, tcs-config ACTIVE 2 / SLEEP 3 / WAKE 3 / CONTROL 1, reg 0x179e0000 (+0x100) and 0x179e0d00
   (+0x3000): same geometry as sweet, so sweet_rpmh.c ports with only the base addresses and the resource name changed.
+
+### Mi 8 touch v7 result (2026-10-28)
+
+- Pins: `SELF hi=1 lo=0` on gpio33/34 (north tile, TLMM writes work); released with pull-up (cfg 0x43) they still read 0.
+- RPMh port works on hardware: `RSC id=0x00010100 cfg=0x80008104`, cmd-db pa 0x85fe0000 size 0xdc0 ver 1 magic 0x0c0330db,
+  `ldoa28` VRM address `0x42100`, TCS0 idle=1, cmd status 0x10101 x2, `RAIL rc=0`. Bus unchanged: avdd alone is not the problem.
+- gpio23 (disp_vddio_vreg enable, touch vdd) read cfg 0 io 0 in the north tile: not asserted. v8 enables it (tile discovery
+  + self-test first).
+
+### Mi 8 touch v8 result (2026-10-28): the chip answers
+
+- gpio23 is in the south tile (0x3d00000; north reads 0): `TILE1 p23=0x203 p22=1 p24=1`. Output high (cfg 0x240, io 3) frees the
+  bus. FTS ACKs at 0x49 on SDA=gpio33 / SCL=gpio34 (swapped order NACKs). The chip also ACKed before the l28 vote.
+- Plain read and `0x80` register read return zeros: not the stmfts command set. Stock driver: ST FTS5 lib 5.2.4 (events 8 bytes;
+  `0x85` read one, `0x86` read all; HW register read `0xFA` + 4-byte address; scan mode `0xA0`), per memory, unverified.
+- For the XNU driver: enable gpio23 (south tile) -> reset pulse (gpio32) -> bit-bang gpio33/34 -> poll events; no clocks, no SE.

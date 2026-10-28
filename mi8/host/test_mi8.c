@@ -82,14 +82,32 @@ static uint32_t pcfg[160], pout[160];
 
 /* --- I2C slave model on SDA = gpio33, SCL = gpio34: FTS-like device at 0x49, reg 0x80 returns 36 01 02 03 ... --- */
 enum { S_IDLE, S_ADDR, S_ACKA, S_WR, S_ACKW, S_RD, S_MACK, S_IGN };
-static int st = S_IDLE, bits, rw, slave_low, regptr = -1, rdi, expect_reg, mack;
+static int st = S_IDLE, bits, rw, slave_low, regptr = -1, rdi, expect_reg, mack, ncmd, cmd0, ev_calls;
+static unsigned char evbuf[8];
 static unsigned shift;
 static int last_sda = 1, last_scl = 1;
 
 static int master_low(unsigned pin) { return (pcfg[pin] & 0x200) && !(pout[pin] & 1); }
 static int line_sda(void) { return !master_low(33) && !slave_low; }
 static int line_scl(void) { return !master_low(34); }
-static unsigned char rdbyte(void) { return regptr == 0x80 ? (unsigned char[]){0x36, 1, 2, 3, 4, 5, 6, 7}[rdi & 7] : 0xA5; }
+static unsigned char rdbyte(void)
+{
+	if (cmd0 == 0xFA) return (unsigned char[]){0x00, 0x36, 0x51, 0x00, 0x01, 0x02, 0x03, 0x04}[rdi & 7];	/* chip id block */
+	if (cmd0 == 0x85 || cmd0 == 0x86) return evbuf[rdi & 7];
+	return 0xA5;
+}
+static void prep_read(void)
+{
+	memset(evbuf, 0, sizeof(evbuf));
+	if (cmd0 == 0x85 || cmd0 == 0x86) {
+		ev_calls++;
+		if (ev_calls == 1) { evbuf[0] = 0x03; evbuf[1] = 0x01; }	/* controller ready */
+		if (ev_calls >= 5 && ev_calls <= 7) {				/* a touch at x=0x123 y=0x456 */
+			unsigned char t[8] = { 0x13, 0x01, 0x23, 0x61, 0x45, 0x10, 0, 0 };
+			memcpy(evbuf, t, 8);
+		}
+	}
+}
 
 static void slave_step(void)
 {
@@ -106,9 +124,10 @@ static void slave_step(void)
 			if ((shift >> 1) == 0x49) { st = S_ACKA; slave_low = 1; } else st = S_IGN;
 		} else if (st == S_ACKA) {
 			slave_low = 0;
-			if (rw) { st = S_RD; bits = 0; rdi = 0; slave_low = !(rdbyte() & 0x80); } else { st = S_WR; bits = 0; shift = 0; }
+			if (rw) { st = S_RD; bits = 0; rdi = 0; prep_read(); slave_low = !(rdbyte() & 0x80); } else { st = S_WR; bits = 0; shift = 0; }
 		} else if (st == S_WR && bits == 8) {
-			if (expect_reg) { regptr = (int)shift; expect_reg = 0; }
+			if (expect_reg) { regptr = (int)shift; expect_reg = 0; ncmd = 0; cmd0 = (int)shift; ncmd = 1; }
+			else if (ncmd < 8) ncmd++;
 			st = S_ACKW; slave_low = 1;
 		} else if (st == S_ACKW) { slave_low = 0; st = S_WR; bits = 0; shift = 0; }
 		else if (st == S_RD) {
@@ -196,18 +215,15 @@ int main(void)
 	mi8_touch_probe();
 	if (getenv("DEBUG_DUMP")) { uint32_t sz; memcpy(&sz, ram[0] + 8, 4); fwrite(ram[0] + 12, 1, sz, stdout); }
 	rh_fake_init();
-	bad += check_zone(ram[0], "TOUCH mi8 touch v8: vddio + avdd + gpio i2c");
-	bad += check_zone(ram[0], "BBPINS0 sda=00000021 idle=00000003");	/* both lines idle high */
-	bad += check_zone(ram[0], "SELF0 hi=00000001 lo=00000000");
+	bad += check_zone(ram[0], "TOUCH mi8 touch v9: fts events");
 	bad += check_zone(ram[0], "V23 hi=00000001 lo=00000000");
-	bad += check_zone(ram[0], "IDLE0 sda=00000001 scl=00000001");
-	bad += check_zone(ram[0], "RAIL rc=00000000");
-	bad += check_zone(ram[0], "L28 addr=00040600");
-	bad += check_zone(ram[0], "I2C492 rc=00000000 byte=00000036");
-	bad += check_zone(ram[0], "INFO2 rc=00000000 b0-3=03020136");
-	bad += check_zone(ram[0], "I2C490 rc=00000000 byte=000000a5");		/* FTS-like slave at 0x49 ACKs */
-	bad += check_zone(ram[0], "I2C4A0 rc=00000001");			/* nothing at 0x4a: NACK */
-	bad += check_zone(ram[0], "INFO0 rc=00000000 b0-3=03020136");	/* register 0x80 read with repeated start */
+	bad += check_zone(ram[0], "VDDIO1 ok=00000001");
+	bad += check_zone(ram[0], "IDLE sda=00000001 scl=00000001");
+	bad += check_zone(ram[0], "ACK49 rc=00000000");
+	bad += check_zone(ram[0], "CHIPID rc=00000000 b0-3=00513600");
+	bad += check_zone(ram[0], "BOOTEV rc=00000000 b0-3=00000103");
+	bad += check_zone(ram[0], "EVT0 b0-3=61230113 b4-7=00001045");
+	bad += check_zone(ram[0], "XY x=00000123 y=00000456");
 	/* no active pipe */
 	regs_sspp0_active = 0; renders = 0; mdp_writes = 0; con_fb = 0; con_stride4 = 1080;
 	mi8_diag(0);
