@@ -800,6 +800,61 @@ static void pin_selftest(unsigned pin, int idx)
 	pair(" ", -1, "rel=", rel, "cfg=", rd32(off));
 }
 
+/* TLMM tiles on this SoC family: north 0x3900000 (holds gpio31-34), south 0x3d00000, west 0x3500000. The right tile for a
+ * pin is the one where its neighbours read non-zero (an unmapped tile reads 0). */
+static uintptr_t find_pin(unsigned pin)
+{
+	static const uint32_t tile_off[3] = { 0x03900000U, 0x03d00000U, 0x03500000U };
+
+	for (int i = 0; i < 3; i++) {
+		uintptr_t base = tile_off[i];
+		uint32_t me = rd32(base + pin * 0x1000U), lo = rd32(base + (pin - 1) * 0x1000U),
+			 hi = rd32(base + (pin + 1) * 0x1000U);
+
+		pair("TILE", i, "p23=", me, "p22=", lo);
+		pair(" ", -1, "p24=", hi, 0, 0);
+		if (lo | hi)
+			return base + pin * 0x1000U;
+	}
+	return TLMM_NORTH + pin * 0x1000U;
+}
+
+/* disp_vddio_vreg (touch vdd, 1.8 V) is a fixed regulator enabled by GPIO23, active high, startup delay 4 ms.
+ * Drive it high if the pin answers (output high reads 1, output low reads 0), else restore it. 1 = enabled. */
+static int vddio_enable(void)
+{
+	uintptr_t off = find_pin(23);
+	uint32_t cfg = rd32(off), io = rd32(off + 4), hi, lo;
+
+	wr32(off + 4, io | 2U);
+	wr32(off, (cfg & ~0x3ffU) | 0x200U | (1U << 6));	/* gpio, no pull, 4 mA, output */
+	delay_us(50);
+	hi = rd32(off + 4) & 1U;
+	wr32(off + 4, rd32(off + 4) & ~2U);
+	delay_us(50);
+	lo = rd32(off + 4) & 1U;
+	pair("V23", -1, "hi=", hi, "lo=", lo);
+	if (hi == 1U && lo == 0U) {
+		wr32(off + 4, rd32(off + 4) | 2U);
+		delay_ms(10);
+		pair(" ", -1, "cfg=", rd32(off), "io=", rd32(off + 4));
+		return 1;
+	}
+	wr32(off + 4, io);
+	wr32(off, cfg);
+	return 0;
+}
+
+static void idle_levels(int stage)
+{
+	for (unsigned order = 0; order < 2; order++) {
+		unsigned sda = order ? 34 : 33, scl = order ? 33 : 34;
+
+		bb_setup(sda, scl);
+		pair("IDLE", (int)(order + stage * 2), "sda=", (uint32_t)line_get(sda), "scl=", (uint32_t)line_get(scl));
+	}
+}
+
 static void bb_scan(int stage)
 {
 	uint8_t b[8];
@@ -830,10 +885,9 @@ void mi8_touch_probe(void)
 
 	nl = 0;
 	tick_i = -1;
-	msg("TOUCH", "mi8 touch v7: rails + gpio i2c");
+	msg("TOUCH", "mi8 touch v8: vddio + avdd + gpio i2c");
 	for (unsigned p = 31; p <= 34; p++)
 		pair("PIN", (int)(p - 30), "cfg=", rd32(pin_cfg(p)), "io=", rd32(pin_cfg(p) + 4));
-	pair("VDDIO", -1, "gpio23=", rd32(pin_cfg(23)), "io=", rd32(pin_cfg(23) + 4));	/* disp_vddio_vreg enable pin */
 	flush_log();
 
 	/* release the touch pins like sweet: irq = input pull-up, reset = output high */
@@ -844,8 +898,11 @@ void mi8_touch_probe(void)
 	pin_selftest(34, 1);
 	flush_log();
 
-	bb_scan(0);	/* before touching any rail */
-	render(C_BLUE, "touch v7 1/2: before rail vote");
+	pair("VDDIO", 1, "ok=", (uint32_t)vddio_enable(), 0, 0);	/* touch vdd: disp_vddio_vreg, gpio23 */
+	idle_levels(0);
+	flush_log();
+	bb_scan(0);	/* vddio only */
+	render(C_BLUE, "touch v8 1/2: vddio on, no avdd vote");
 	delay_ms(8000);
 
 	/* pm8998_l28 (touch avdd) through RPMh, then a reset pulse so the chip boots with power present */
@@ -859,12 +916,13 @@ void mi8_touch_probe(void)
 		delay_ms(10);
 		wr32(pin_cfg(32) + 4, rd32(pin_cfg(32) + 4) | 2U);	/* reset high */
 		delay_ms(400);
+		idle_levels(1);
 		bb_scan(1);
 	}
 	pair("LEGEND", -1, "rc 0=ack", 0, "1=nack", 0);
 	pair(" ", -1, "2=stuck", 0, "RAIL 0=ok", 0);
 	flush_log();
-	render(C_GREEN, "touch v7 2/2: after rail vote");
+	render(C_GREEN, "touch v8 2/2: after avdd vote");
 	delay_ms(120000);
 }
 

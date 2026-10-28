@@ -192,12 +192,15 @@ int main(void)
 	printf("titles: %s | %s | %s | %s\n", screen_titles[0], screen_titles[1], screen_titles[2], screen_titles[3]);
 
 	rh_fake_init();
+	pcfg[22] = 1; pcfg[24] = 1;	/* neighbours of gpio23 are mapped in the north tile */
 	mi8_touch_probe();
 	if (getenv("DEBUG_DUMP")) { uint32_t sz; memcpy(&sz, ram[0] + 8, 4); fwrite(ram[0] + 12, 1, sz, stdout); }
 	rh_fake_init();
-	bad += check_zone(ram[0], "TOUCH mi8 touch v7: rails + gpio i2c");
+	bad += check_zone(ram[0], "TOUCH mi8 touch v8: vddio + avdd + gpio i2c");
 	bad += check_zone(ram[0], "BBPINS0 sda=00000021 idle=00000003");	/* both lines idle high */
 	bad += check_zone(ram[0], "SELF0 hi=00000001 lo=00000000");
+	bad += check_zone(ram[0], "V23 hi=00000001 lo=00000000");
+	bad += check_zone(ram[0], "IDLE0 sda=00000001 scl=00000001");
 	bad += check_zone(ram[0], "RAIL rc=00000000");
 	bad += check_zone(ram[0], "L28 addr=00040600");
 	bad += check_zone(ram[0], "I2C492 rc=00000000 byte=00000036");

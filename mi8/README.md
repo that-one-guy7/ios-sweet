@@ -1,15 +1,13 @@
 # Mi 8 (dipper, SDM845) bring-up
 
-**Touch probe (shim v7: rails + GPIO bit-bang I2C):** v5 showed the touch I2C controller (i2c@a98000 = global SE14, pins
-gpio33/34 function qup14) is GSI/DMA-only (FIFO interface disabled), so the touch bus is bit-banged through TLMM like the
-LG V60 port does. v6 result: SDA and SCL both read low (`idle=0`) even as inputs with pull-ups, so every transfer was
-"stuck" (`rc=2`). v7 adds: a pin self-test (drive gpio33/34 high and low and read them back: `SELF hi=1 lo=0` means TLMM
-writes and the input path work, so a low idle means something external holds the line), the state of the vddio enable
-pin (gpio23, `disp_vddio_vreg`, regulator-boot-on), then an RPMh vote for **pm8998_l28** (the touch avdd, 3.3 V; port of
-sweet_rpmh.c: apps_rsc DRV2 at 0x179e0000, cmd-db locator 0x0c3f000c), a reset pulse, and a second I2C scan. `RAIL rc`:
-0 ok, 1 RSC geometry, 2/3 cmd-db, 4/5 lookup, 6 TCS busy/inherited state (nothing written), 7 readback, 8 vote timeout.
-`I2C49n rc` 0 = ACK (n = scan, 0/1 before the vote, 2/3 after), 1 = NACK, 2 = bus stuck. The host test runs the RPMh path
-against fakes and the I2C code against a slave model.
+**Touch probe (shim v8: vddio + avdd + GPIO bit-bang I2C):** the touch bus (global SE14, gpio33/34) is bit-banged because the SE is
+GSI-only. v7 on a real phone: pin writes work (`SELF hi=1 lo=0`), the bus reads low even released (`rel=0`), the RPMh vote for
+pm8998_l28 worked (`RAIL rc=0`, TCS completed, `L28 addr=0x42100`) yet the bus stayed low, and gpio23 (the enable of
+`disp_vddio_vreg`, the touch vdd) read cfg 0 / io 0, i.e. not driven: the touch chip's I/O supply is most likely off and its
+pins clamp the bus. v8 finds gpio23's tile (the one whose neighbours read non-zero), drives it high only if the pin answers,
+waits 10 ms, reports bus idle levels (`IDLE n sda= scl=`, 1/1 = free), scans, then votes L28, pulses reset and scans again.
+`V23 hi=1 lo=0` = pin answered; `TILE` lines show what each tile reads for gpio22/23/24. `RAIL rc` and `I2C49n rc` as before
+(0 ack, 1 nack, 2 stuck).
 
 **Boot 1 result (2026-10-25):** kernel text on screen up to `zone_init`, then frozen on both images. Cause found in the
 patches: the boot-CPU driver (0018) and AppleKeyStore (0038) match `IONameMatch qcom,kryo470`, and mkadt had replaced it
