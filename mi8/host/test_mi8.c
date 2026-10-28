@@ -222,9 +222,12 @@ int main(void)
 	mi8_touch_probe();
 	if (getenv("DEBUG_DUMP")) { uint32_t sz; memcpy(&sz, ram[0] + 8, 4); fwrite(ram[0] + 12, 1, sz, stdout); }
 	rh_fake_init();
-	bad += check_zone(ram[0], "TOUCH mi8 touch v11: fts raw reads");
+	bad += check_zone(ram[0], "TOUCH mi8 touch v12: vddio + avdd + fts");
 	bad += check_zone(ram[0], "V23 hi=00000001 lo=00000000");
 	bad += check_zone(ram[0], "VDDIO1 ok=00000001");
+	bad += check_zone(ram[0], "RAIL rc=00000000");
+	bad += check_zone(ram[0], "L28 addr=00040600");
+	bad += check_zone(ram[0], "RHTCS0 idle=00000001");
 	bad += check_zone(ram[0], "IDLE sda=00000001 scl=00000001");
 	bad += check_zone(ram[0], "ACK49 rc=00000000");
 	bad += check_zone(ram[0], "CHIPID rc=00000000 b0-3=00513600");

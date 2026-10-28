@@ -1,12 +1,11 @@
 # Mi 8 (dipper, SDM845) bring-up
 
-**Touch probe (shim v11: FTS raw reads):** v10 on a real phone: all three scan-mode commands ACKed, but the irq line (gpio31) was
-low on EVERY poll (`POLLS n == irqlow`, ~1250) while every 0x85 read produced no event: the chip asserts the interrupt
-continuously and our reads do not pop anything useful (or the transfers fail, v10 did not count failures). v11 reads all
-events (`0x86`, 32 bytes) whenever the line is low, one (`0x85`) every 200 ms otherwise, and shows: `ST85/ST86 ok= bad=`
-(good and failed transfers), `NZ n85= n86=` (reads with a non-zero first byte), `IRQHI after=` (times the line was already
-high right after a read: reading does clear it), `RAW86/RAW86B/RAW85` the latest raw bytes even if zero, `PHn rc= ev=`
-as before. Touch the screen throughout (about 50 s); the last screen is green and stays up 20 s.
+**Touch probe (shim v12: both rails + FTS):** v11 on a real phone: the FTS protocol works end to end. After `A0 00 FF` the chip
+echoed `43 01 A0 00 FF` (status event, echo of the scan-mode command) and the irq line fell once; no touch event (0x13/0x23/0x33)
+followed. v9-v11 had dropped the pm8998_l28 (avdd) vote because the chip already ACKed in v8, but I2C runs on vdd alone while
+touch sensing is analog and needs avdd. v12 votes l28 again (RPMh, `RAIL rc=0`) after enabling gpio23 (vdd), then resets the
+chip and runs the same scan-mode attempts and raw event reads as v11. Expect `EVT` lines starting `13`/`23`/`33` and `XY`
+changing while you touch the screen.
 
 **Boot 1 result (2026-10-25):** kernel text on screen up to `zone_init`, then frozen on both images. Cause found in the
 patches: the boot-CPU driver (0018) and AppleKeyStore (0038) match `IONameMatch qcom,kryo470`, and mkadt had replaced it

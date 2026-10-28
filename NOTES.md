@@ -520,3 +520,9 @@ What it took today (in order): 0058 HID services (Apple IOHIDFamily-1915 user cl
   0x85 read had a zero first byte. In v9 (no scan command) the line went high after BOOTEV. Hypotheses: the chip now streams
   events that 0x85 does not return (v11 reads 0x86 x 32 bytes and logs raw bytes and failures), or the irq pin is held low
   for another reason (reading gpio31 only; no write).
+
+### Mi 8 touch v11 result (2026-10-28): FTS echoes scan mode, no touches (avdd)
+
+- `EVT0 = 43 01 A0 00 FF 00 00 00` (STATUS_UPDATE / echo of A0 00 FF), `ST85 bad=0`, `ST86 bad=0`: transfers are clean.
+  Only one event and one irq pulse; no 0x13/0x23/0x33. Reading clears the irq (`IRQHI after == low`).
+- Cause hypothesis: avdd (pm8998_l28) was not voted in v9-v11 (it was in v7/v8). v12 restores the vote.
