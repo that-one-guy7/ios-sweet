@@ -595,7 +595,7 @@ static uint32_t le32(const uint8_t *b)
 
 #define FTS_ADDR	0x49
 #define EV_LINES	5
-static int ev_i = -1, xy_i = -1, ph_i = -1;
+static int ev_i = -1, xy_i = -1, ph_i = -1, raw_i = -1;
 
 /* STM FTS5 event: 8 bytes. id 0x13 enter / 0x23 motion / 0x33 leave (touch), 0x03 controller ready, 0x00 none.
  * Position as in ST's fts5 driver (unverified for this chip): x = (b3 & 0x0f) << 8 | b2, y = b4 << 4 | b3 >> 4. */
@@ -616,16 +616,31 @@ static void fts_show_event(const uint8_t *e, unsigned n)
 	L[xy_i + 1].av = n;
 }
 
+static unsigned ok85, bad85, ok86, bad86, nz85, nz86, hi_after;
+static int st_i = -1;
+
+static void st_update(unsigned irq_low, unsigned polls)
+{
+	if (st_i < 0)
+		return;
+	L[st_i].av = ok85;	L[st_i].bv = bad85;
+	L[st_i + 1].av = ok86;	L[st_i + 1].bv = bad86;
+	L[st_i + 2].av = nz85;	L[st_i + 2].bv = nz86;
+	L[st_i + 3].av = hi_after;	L[st_i + 3].bv = irq_low;
+	L[st_i + 4].av = polls;
+}
+
 void mi8_touch_probe(void)
 {
-	uint8_t w[5], r[8], ev[8];
+	uint8_t w[5], r[8], ev[8], big[32];
 	int rc;
 	unsigned irq_low = 0, polls = 0, events = 0;
 
 	nl = 0;
 	tick_i = -1;
-	ev_i = xy_i = ph_i = -1;
-	msg("TOUCH", "mi8 touch v10: fts scan mode");
+	ev_i = xy_i = ph_i = st_i = -1;
+	ok85 = bad85 = ok86 = bad86 = nz85 = nz86 = hi_after = 0;
+	msg("TOUCH", "mi8 touch v11: fts raw reads");
 	pair("PIN", 1, "cfg=", rd32(pin_cfg(31)), "io=", rd32(pin_cfg(31) + 4));
 	/* touch rails: vdd = disp_vddio_vreg (gpio23); avdd (pm8998_l28) was already on in v8 (chip ACKed before the vote) */
 	pair("VDDIO", 1, "ok=", (uint32_t)vddio_enable(), 0, 0);
@@ -655,7 +670,7 @@ void mi8_touch_probe(void)
 	memset_b(ev, 0, sizeof(ev));
 	rc = bb_xfer(FTS_ADDR, w, 1, ev, 8);
 	pair("BOOTEV", -1, "rc=", (uint32_t)rc, "b0-3=", le32(ev));
-	pair(" ", -1, "b4-7=", le32(ev + 4), 0, 0);
+	pair(" ", -1, "b4-7=", le32(ev + 4), "irq=", (uint32_t)line_get(31));
 	ev_i = nl;
 	for (int k = 0; k < EV_LINES; k++)
 		pair("EVT", k, "b0-3=", 0, "b4-7=", 0);
@@ -663,11 +678,23 @@ void mi8_touch_probe(void)
 	pair("XY", -1, "x=", 0, "y=", 0);
 	pair(" ", -1, "events=", 0, 0, 0);
 	pair("POLLS", -1, "n=", 0, "irqlow=", 0);
+	st_i = nl;
+	pair("ST85", -1, "ok=", 0, "bad=", 0);
+	pair("ST86", -1, "ok=", 0, "bad=", 0);
+	pair("NZ", -1, "n85=", 0, "n86=", 0);
+	pair("IRQHI", -1, "after=", 0, "low=", 0);
+	pair(" ", -1, "polls=", 0, 0, 0);
+	raw_i = nl;
+	pair("RAW86", -1, "b0-3=", 0, "b4-7=", 0);
+	pair("RAW86B", -1, "b8-11=", 0, "b12-15=", 0);
+	pair("RAW85", -1, "b0-3=", 0, "b4-7=", 0);
 	flush_log();
 
-	/* The chip boots with sensing off: the stock driver sends "scan mode active" (0xA0, 0x00, 0xFF, per memory of the ST fts5
-	 * library). Three attempts of 15 s each, touch the screen throughout; PHn shows which one produced events.
-	 *   0: A0 00 FF   1: A0 00 01   2: 93 (older ST FTS "MS_MT_SENSE_ON") */
+	/* Three scan-mode attempts of 15 s (touch the screen throughout). While the irq line is low read ALL events (0x86,
+	 * 32 bytes = 4 events), else one (0x85, 8 bytes) every 200 ms. v10 showed the irq line low on every poll and every
+	 * 0x85 read empty: ST85/ST86 count good and failed transfers, NZ the reads with a non-zero first byte, IRQHI how often
+	 * the line was already high right after a read, RAW* the latest raw bytes even when they are zero.
+	 *   0: A0 00 FF   1: A0 00 01   2: 93 */
 	ph_i = nl;
 	for (int k = 0; k < 3; k++)
 		pair("PH", k, "rc=", 0, "ev=", 0);
@@ -685,30 +712,58 @@ void mi8_touch_probe(void)
 		for (unsigned t = 0; t < 750; t++) {
 			int pending = !line_get(31);
 
-			if (pending)
+			if (pending) {
 				irq_low++;
-			if (pending || (t % 10) == 0) {
+				w[0] = 0x86;
+				memset_b(big, 0, sizeof(big));
+				polls++;
+				if (bb_xfer(FTS_ADDR, w, 1, big, 32)) {
+					bad86++;
+				} else {
+					ok86++;
+					L[raw_i].av = le32(big);	L[raw_i].bv = le32(big + 4);
+					L[raw_i + 1].av = le32(big + 8);	L[raw_i + 1].bv = le32(big + 12);
+					for (unsigned k = 0; k < 4; k++) {
+						if (big[8 * k]) {
+							nz86++;
+							events++;
+							fts_show_event(big + 8 * k, events);
+						}
+					}
+				}
+				if (line_get(31))
+					hi_after++;
+			} else if ((t % 10) == 0) {
 				w[0] = 0x85;
 				memset_b(ev, 0, sizeof(ev));
 				polls++;
-				if (!bb_xfer(FTS_ADDR, w, 1, ev, 8) && ev[0]) {
-					events++;
-					fts_show_event(ev, events);
+				if (bb_xfer(FTS_ADDR, w, 1, ev, 8)) {
+					bad85++;
+				} else {
+					ok85++;
+					L[raw_i + 2].av = le32(ev);	L[raw_i + 2].bv = le32(ev + 4);
+					if (ev[0]) {
+						nz85++;
+						events++;
+						fts_show_event(ev, events);
+					}
 				}
 			}
 			if ((t % 50) == 49) {
 				L[ph_i + (int)phase].bv = events - before;
 				L[xy_i + 2].av = polls;
 				L[xy_i + 2].bv = irq_low;
-				render(C_BLUE, "touch v10: TOUCH THE SCREEN");
+				st_update(irq_low, polls);
+				render(C_BLUE, "touch v11: TOUCH THE SCREEN");
 				flush_log();
 			}
 			delay_ms(20);
 		}
 	}
-	render(C_GREEN, "touch v10: done, rebooting");
+	st_update(irq_low, polls);
+	render(C_GREEN, "touch v11: done, rebooting");
 	flush_log();
-	delay_ms(15000);
+	delay_ms(20000);
 }
 
 void mi8_panic_log(const char *stage, uint64_t slot, uint64_t esr, uint64_t elr, uint64_t far)

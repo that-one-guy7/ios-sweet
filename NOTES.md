@@ -513,3 +513,10 @@ What it took today (in order): 0058 HID services (Apple IOHIDFamily-1915 user cl
 - `CHIPID` block = `36 39 03 00 54 00 39 19` (chip id 0x3936, FW 0x0054, SVN 0x1939: matches dmesg `FW VER = 0054`, `SVN REV = 1939`).
   `BOOTEV` = `03 00 00 00 ...` controller ready; gpio31 low right after reset, no events or irq while touching.
 - v10 tries `A0 00 FF`, `A0 00 01`, `93` (sense on) to start scanning.
+
+### Mi 8 touch v10 result (2026-10-28): irq stuck low
+
+- After the scan-mode commands (A0 00 FF, A0 00 01, 93: all ACKed) gpio31 was low on every poll (`irqlow == polls`, 0x4e2) and every
+  0x85 read had a zero first byte. In v9 (no scan command) the line went high after BOOTEV. Hypotheses: the chip now streams
+  events that 0x85 does not return (v11 reads 0x86 x 32 bytes and logs raw bytes and failures), or the irq pin is held low
+  for another reason (reading gpio31 only; no write).

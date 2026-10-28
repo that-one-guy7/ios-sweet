@@ -84,6 +84,7 @@ static uint32_t pcfg[160], pout[160];
 enum { S_IDLE, S_ADDR, S_ACKA, S_WR, S_ACKW, S_RD, S_MACK, S_IGN };
 static int st = S_IDLE, bits, rw, slave_low, regptr = -1, rdi, expect_reg, mack, ncmd, cmd0, ev_calls, sense_on;
 static unsigned char evbuf[8];
+static int queued;
 static unsigned shift;
 static int last_sda = 1, last_scl = 1;
 
@@ -101,8 +102,9 @@ static void prep_read(void)
 	memset(evbuf, 0, sizeof(evbuf));
 	if (cmd0 == 0x85 || cmd0 == 0x86) {
 		ev_calls++;
+		if (sense_on && (ev_calls % 7) == 0) queued = 3;
 		if (ev_calls == 1) { evbuf[0] = 0x03; evbuf[1] = 0x01; }	/* controller ready */
-		if (sense_on && ev_calls >= 3 && (ev_calls % 4) == 0) {		/* a touch at x=0x123 y=0x456, only once sensing was enabled */
+		if (sense_on && queued > 0) { queued--;					/* a touch at x=0x123 y=0x456, only once sensing was enabled */
 			unsigned char t[8] = { 0x13, 0x01, 0x23, 0x61, 0x45, 0x10, 0, 0 };
 			memcpy(evbuf, t, 8);
 		}
@@ -158,6 +160,7 @@ uint32_t rd32(uintptr_t a)
 		if (off == 0) return pcfg[pin];
 		if (off == 4) {
 			unsigned in = (pcfg[pin] & 0x200) ? (pout[pin] & 1) : 1;
+			if (pin == 31) in = (sense_on && queued > 0) ? 0 : 1;	/* irq low while events are queued */
 			if (pin == 33) in = (unsigned)line_sda();
 			if (pin == 34) in = (unsigned)line_scl();
 			return in | (pout[pin] << 1);
@@ -219,7 +222,7 @@ int main(void)
 	mi8_touch_probe();
 	if (getenv("DEBUG_DUMP")) { uint32_t sz; memcpy(&sz, ram[0] + 8, 4); fwrite(ram[0] + 12, 1, sz, stdout); }
 	rh_fake_init();
-	bad += check_zone(ram[0], "TOUCH mi8 touch v10: fts scan mode");
+	bad += check_zone(ram[0], "TOUCH mi8 touch v11: fts raw reads");
 	bad += check_zone(ram[0], "V23 hi=00000001 lo=00000000");
 	bad += check_zone(ram[0], "VDDIO1 ok=00000001");
 	bad += check_zone(ram[0], "IDLE sda=00000001 scl=00000001");
@@ -229,6 +232,8 @@ int main(void)
 	bad += check_zone(ram[0], "EVT0 b0-3=61230113 b4-7=00001045");
 	bad += check_zone(ram[0], "XY x=00000123 y=00000456");
 	bad += check_zone(ram[0], "PH0 rc=00000000");
+	bad += check_zone(ram[0], "RAW86 b0-3=");
+	bad += check_zone(ram[0], "ST86 ok=");
 	/* no active pipe */
 	regs_sspp0_active = 0; renders = 0; mdp_writes = 0; con_fb = 0; con_stride4 = 1080;
 	mi8_diag(0);

@@ -1,12 +1,12 @@
 # Mi 8 (dipper, SDM845) bring-up
 
-**Touch probe (shim v10: FTS scan mode):** v9 on a real phone: the FTS5 commands work. `CHIPID` (0xFA + 0x20000000) returned
-`36 39 03 00 54 00 39 19`: chip id 0x3936, FW 0x0054, SVN 0x1939 (dmesg: FW VER 0054, SVN REV 1939). `BOOTEV` (0x86) returned
-`03 00 ...` (controller ready), gpio31 was low after reset (event pending). Touching changed nothing and the irq line never
-fell: the chip boots with sensing off. v10 sends the scan-mode commands the stock driver uses, three attempts of 15 s
-(`PH0` A0 00 FF, `PH1` A0 00 01, `PH2` 93), polling 0x85 and showing `PHn rc= ev=` (rc 0 = ACKed, ev = events seen in that
-phase), the last five events `EVT0..4` and the decoded `XY`. Touch the screen throughout (about 50 s); the last screen is
-green and stays up 15 s: photograph that one.
+**Touch probe (shim v11: FTS raw reads):** v10 on a real phone: all three scan-mode commands ACKed, but the irq line (gpio31) was
+low on EVERY poll (`POLLS n == irqlow`, ~1250) while every 0x85 read produced no event: the chip asserts the interrupt
+continuously and our reads do not pop anything useful (or the transfers fail, v10 did not count failures). v11 reads all
+events (`0x86`, 32 bytes) whenever the line is low, one (`0x85`) every 200 ms otherwise, and shows: `ST85/ST86 ok= bad=`
+(good and failed transfers), `NZ n85= n86=` (reads with a non-zero first byte), `IRQHI after=` (times the line was already
+high right after a read: reading does clear it), `RAW86/RAW86B/RAW85` the latest raw bytes even if zero, `PHn rc= ev=`
+as before. Touch the screen throughout (about 50 s); the last screen is green and stays up 20 s.
 
 **Boot 1 result (2026-10-25):** kernel text on screen up to `zone_init`, then frozen on both images. Cause found in the
 patches: the boot-CPU driver (0018) and AppleKeyStore (0038) match `IONameMatch qcom,kryo470`, and mkadt had replaced it
