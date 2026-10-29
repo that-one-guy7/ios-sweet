@@ -526,3 +526,9 @@ What it took today (in order): 0058 HID services (Apple IOHIDFamily-1915 user cl
 - `EVT0 = 43 01 A0 00 FF 00 00 00` (STATUS_UPDATE / echo of A0 00 FF), `ST85 bad=0`, `ST86 bad=0`: transfers are clean.
   Only one event and one irq pulse; no 0x13/0x23/0x33. Reading clears the irq (`IRQHI after == low`).
 - Cause hypothesis: avdd (pm8998_l28) was not voted in v9-v11 (it was in v7/v8). v12 restores the vote.
+
+### Mi 8 touch v12 result (2026-10-28): events stream with both rails, meaning unclear
+
+- avdd vote restored (`RAIL rc=0`): the chip now streams events constantly (0x2328 events in ~50 s, ST86 ok=0x8ca bad=0, irq low on
+  every poll). Records: `23 11 5D E3 54 00 00 1E` and `23 01 D0 63 54 00 00 1D` alternating; fts5 decode: (861,1358) type 1 and
+  (976,1350) type 0, z=0, last byte 0x1c-0x1f. Fixed x/y while "touching" => v13 guided windows + markers to tell touch from noise.

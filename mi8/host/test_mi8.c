@@ -18,6 +18,7 @@ void con_str(const char *l, const char *s) { if (!strcmp(l, "MI8") && renders < 
 void con_hex2(const char *l, const char *a, uint32_t va, const char *b, uint32_t vb) { (void)l; (void)a; (void)va; (void)b; (void)vb; }
 
 static uint8_t ram[2][0x40000];
+static uint32_t fake_fb[1080 * 2248];
 static uint32_t regs_sspp0_active = 1;
 static uint64_t tick;
 
@@ -219,10 +220,11 @@ int main(void)
 
 	rh_fake_init();
 	pcfg[22] = 1; pcfg[24] = 1;	/* neighbours of gpio23 are mapped in the north tile */
+	con_fb = fake_fb; con_stride4 = 1080;	/* the real pointer from mi8_diag is a phone address */
 	mi8_touch_probe();
 	if (getenv("DEBUG_DUMP")) { uint32_t sz; memcpy(&sz, ram[0] + 8, 4); fwrite(ram[0] + 12, 1, sz, stdout); }
 	rh_fake_init();
-	bad += check_zone(ram[0], "TOUCH mi8 touch v12: vddio + avdd + fts");
+	bad += check_zone(ram[0], "TOUCH mi8 touch v13: guided touch test");
 	bad += check_zone(ram[0], "V23 hi=00000001 lo=00000000");
 	bad += check_zone(ram[0], "VDDIO1 ok=00000001");
 	bad += check_zone(ram[0], "RAIL rc=00000000");
@@ -234,7 +236,9 @@ int main(void)
 	bad += check_zone(ram[0], "BOOTEV rc=00000000 b0-3=00000103");
 	bad += check_zone(ram[0], "EVT0 b0-3=61230113 b4-7=00001045");
 	bad += check_zone(ram[0], "XY x=00000123 y=00000456");
-	bad += check_zone(ram[0], "PH0 rc=00000000");
+	bad += check_zone(ram[0], "SCANCMD rc=00000000");
+	bad += check_zone(ram[0], "WIN1 n=");
+	if (fake_fb[1110 * 1080 + 291] != 0xffffffffU) { printf("marker missing at x=291 y=1110: %08x\n", fake_fb[1110 * 1080 + 291]); bad++; }
 	bad += check_zone(ram[0], "RAW86 b0-3=");
 	bad += check_zone(ram[0], "ST86 ok=");
 	/* no active pipe */

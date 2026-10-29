@@ -827,7 +827,7 @@ static uint32_t le32(const uint8_t *b)
 
 #define FTS_ADDR	0x49
 #define EV_LINES	5
-static int ev_i = -1, xy_i = -1, ph_i = -1, raw_i = -1;
+static int ev_i = -1, xy_i = -1, raw_i = -1;
 
 /* STM FTS5 event: 8 bytes. id 0x13 enter / 0x23 motion / 0x33 leave (touch), 0x03 controller ready, 0x00 none.
  * Position as in ST's fts5 driver (unverified for this chip): x = (b3 & 0x0f) << 8 | b2, y = b4 << 4 | b3 >> 4. */
@@ -862,17 +862,125 @@ static void st_update(unsigned irq_low, unsigned polls)
 	L[st_i + 4].av = polls;
 }
 
+static int win_i = -1;
+static uint32_t pt_x[2], pt_y[2];
+static int pt_next, pt_valid;
+static uint8_t cmd_scan[3];
+
+static void draw_pts(void)
+{
+	for (int k = 0; k < 2; k++) {
+		int slot = (pt_next + k) & 1;	/* k = 0 is the older one, k = 1 the newest */
+		uint32_t color = k ? 0xffffffffU : 0xffffff00U;
+
+		if (!(pt_valid & (1 << slot)))
+			continue;
+		for (int dy = -14; dy <= 14; dy++) {
+			for (int dx = -14; dx <= 14; dx++) {
+				int px = (int)pt_x[slot] + dx, py = (int)pt_y[slot] + dy;
+
+				if (px >= 0 && px < FB_W && py >= 0 && py < FB_H)
+					con_fb[(unsigned)py * con_stride4 + (unsigned)px] = color;
+			}
+		}
+	}
+	dsb();
+}
+
+static void win_event(int w, const uint8_t *e)
+{
+	int base = win_i + w * 3;
+	uint32_t x = ((uint32_t)(e[3] & 0x0fU) << 8) | e[2], y = ((uint32_t)e[4] << 4) | (e[3] >> 4), z = e[5];
+
+	L[base].av++;
+	if (z > L[base].bv)
+		L[base].bv = z;
+	if (x < L[base + 1].av)
+		L[base + 1].av = x;
+	if (x > L[base + 1].bv)
+		L[base + 1].bv = x;
+	if (y < L[base + 2].av)
+		L[base + 2].av = y;
+	if (y > L[base + 2].bv)
+		L[base + 2].bv = y;
+	pt_x[pt_next] = x;
+	pt_y[pt_next] = y;
+	pt_valid |= 1 << pt_next;
+	pt_next ^= 1;
+}
+
+/* one timed window: poll like before (0x86 x 32 bytes while the irq line is low, else 0x85 every 200 ms) */
+static void run_window(int w, const char *title, unsigned seconds, unsigned *irq_low, unsigned *polls, unsigned *events)
+{
+	uint8_t cmd, big[32], one[8];
+
+	for (unsigned t = 0; t < seconds * 50U; t++) {
+		int pending = !line_get(31);
+
+		if (pending) {
+			(*irq_low)++;
+			cmd = 0x86;
+			memset_b(big, 0, sizeof(big));
+			(*polls)++;
+			if (bb_xfer(FTS_ADDR, &cmd, 1, big, 32)) {
+				bad86++;
+			} else {
+				ok86++;
+				L[raw_i].av = le32(big);	L[raw_i].bv = le32(big + 4);
+				L[raw_i + 1].av = le32(big + 8);	L[raw_i + 1].bv = le32(big + 12);
+				for (unsigned k = 0; k < 4; k++) {
+					if (big[8 * k]) {
+						nz86++;
+						(*events)++;
+						fts_show_event(big + 8 * k, *events);
+						if (big[8 * k] == 0x13 || big[8 * k] == 0x23 || big[8 * k] == 0x33)
+							win_event(w, big + 8 * k);
+					}
+				}
+			}
+			if (line_get(31))
+				hi_after++;
+		} else if ((t % 10) == 0) {
+			cmd = 0x85;
+			memset_b(one, 0, sizeof(one));
+			(*polls)++;
+			if (bb_xfer(FTS_ADDR, &cmd, 1, one, 8)) {
+				bad85++;
+			} else {
+				ok85++;
+				if (one[0]) {
+					nz85++;
+					(*events)++;
+					fts_show_event(one, *events);
+					if (one[0] == 0x13 || one[0] == 0x23 || one[0] == 0x33)
+						win_event(w, one);
+				}
+			}
+		}
+		if ((t % 25) == 24) {
+			L[xy_i + 2].av = *polls;
+			L[xy_i + 2].bv = *irq_low;
+			st_update(*irq_low, *polls);
+			render(C_BLUE, title);
+			draw_pts();
+			flush_log();
+		}
+		delay_ms(20);
+	}
+}
+
 void mi8_touch_probe(void)
 {
-	uint8_t w[5], r[8], ev[8], big[32];
+	uint8_t w[5], r[8], ev[8];
 	int rc;
 	unsigned irq_low = 0, polls = 0, events = 0;
 
 	nl = 0;
 	tick_i = -1;
-	ev_i = xy_i = ph_i = st_i = -1;
+	ev_i = xy_i = st_i = win_i = -1;
+	pt_next = pt_valid = 0;
 	ok85 = bad85 = ok86 = bad86 = nz85 = nz86 = hi_after = 0;
-	msg("TOUCH", "mi8 touch v12: vddio + avdd + fts");
+	msg("TOUCH", "mi8 touch v13: guided touch test");
 	pair("PIN", 1, "cfg=", rd32(pin_cfg(31)), "io=", rd32(pin_cfg(31) + 4));
 	/* Both touch rails, as Android does (DT: fts vdd = disp_vddio_vreg on gpio23, avdd = pm8998_l28 3.3 V via RPMh).
 	 * v9-v11 skipped the avdd vote on the wrong assumption "the chip ACKs, so avdd is on": the digital side answers on vdd
@@ -928,78 +1036,29 @@ void mi8_touch_probe(void)
 	pair("RAW85", -1, "b0-3=", 0, "b4-7=", 0);
 	flush_log();
 
-	/* Three scan-mode attempts of 15 s (touch the screen throughout). While the irq line is low read ALL events (0x86,
-	 * 32 bytes = 4 events), else one (0x85, 8 bytes) every 200 ms. v10 showed the irq line low on every poll and every
-	 * 0x85 read empty: ST85/ST86 count good and failed transfers, NZ the reads with a non-zero first byte, IRQHI how often
-	 * the line was already high right after a read, RAW* the latest raw bytes even when they are zero.
-	 *   0: A0 00 FF   1: A0 00 01   2: 93 */
-	ph_i = nl;
-	for (int k = 0; k < 3; k++)
-		pair("PH", k, "rc=", 0, "ev=", 0);
-	for (unsigned phase = 0; phase < 3; phase++) {
-		uint8_t cmd[3];
-		unsigned ncmd, before = events;
-
-		cmd[0] = phase == 2 ? 0x93 : 0xa0;
-		cmd[1] = 0x00;
-		cmd[2] = phase == 0 ? 0xff : 0x01;
-		ncmd = phase == 2 ? 1 : 3;
-		rc = bb_xfer(FTS_ADDR, cmd, ncmd, 0, 0);
-		L[ph_i + (int)phase].av = (uint32_t)rc;
-		delay_ms(50);
-		for (unsigned t = 0; t < 750; t++) {
-			int pending = !line_get(31);
-
-			if (pending) {
-				irq_low++;
-				w[0] = 0x86;
-				memset_b(big, 0, sizeof(big));
-				polls++;
-				if (bb_xfer(FTS_ADDR, w, 1, big, 32)) {
-					bad86++;
-				} else {
-					ok86++;
-					L[raw_i].av = le32(big);	L[raw_i].bv = le32(big + 4);
-					L[raw_i + 1].av = le32(big + 8);	L[raw_i + 1].bv = le32(big + 12);
-					for (unsigned k = 0; k < 4; k++) {
-						if (big[8 * k]) {
-							nz86++;
-							events++;
-							fts_show_event(big + 8 * k, events);
-						}
-					}
-				}
-				if (line_get(31))
-					hi_after++;
-			} else if ((t % 10) == 0) {
-				w[0] = 0x85;
-				memset_b(ev, 0, sizeof(ev));
-				polls++;
-				if (bb_xfer(FTS_ADDR, w, 1, ev, 8)) {
-					bad85++;
-				} else {
-					ok85++;
-					L[raw_i + 2].av = le32(ev);	L[raw_i + 2].bv = le32(ev + 4);
-					if (ev[0]) {
-						nz85++;
-						events++;
-						fts_show_event(ev, events);
-					}
-				}
-			}
-			if ((t % 50) == 49) {
-				L[ph_i + (int)phase].bv = events - before;
-				L[xy_i + 2].av = polls;
-				L[xy_i + 2].bv = irq_low;
-				st_update(irq_low, polls);
-				render(C_BLUE, "touch v12: TOUCH THE SCREEN");
-				flush_log();
-			}
-			delay_ms(20);
-		}
+	/* v12 on a real phone: with both rails on the chip streams ~180 events/s, two alternating records
+	 * `23 11 5D E3 54 00 00 1E` / `23 01 D0 63 54 00 00 1D`: decoded as ST fts5 motion points they sit at fixed x,y while
+	 * the last byte wobbles, and the owner reported that touching changed nothing. This build runs four timed windows
+	 * with on-screen instructions and per-window statistics (count, max byte5, min/max x and y by the fts5 decode), and
+	 * draws a marker at the last two decoded points (white = newest, yellow = previous; coordinates drawn unscaled).
+	 * If x/y follow your finger the decode is right; if the stats are identical in every window the stream is not touch. */
+	cmd_scan[0] = 0xa0; cmd_scan[1] = 0x00; cmd_scan[2] = 0xff;
+	rc = bb_xfer(FTS_ADDR, cmd_scan, 3, 0, 0);
+	pair("SCANCMD", -1, "rc=", (uint32_t)rc, 0, 0);
+	win_i = nl;
+	for (int k = 0; k < 4; k++) {
+		pair("WIN", k, "n=", 0, "zmax=", 0);
+		pair(" ", -1, "x0=", 0xffff, "x1=", 0);
+		pair(" ", -1, "y0=", 0xffff, "y1=", 0);
 	}
+	delay_ms(50);
+	run_window(0, "A: DO NOT TOUCH (hold by the edges)", 10, &irq_low, &polls, &events);
+	run_window(1, "B: TOUCH TOP-LEFT CORNER ONLY", 12, &irq_low, &polls, &events);
+	run_window(2, "C: TOUCH BOTTOM-RIGHT CORNER ONLY", 12, &irq_low, &polls, &events);
+	run_window(3, "D: DRAG ONE FINGER SLOWLY DOWN", 12, &irq_low, &polls, &events);
 	st_update(irq_low, polls);
-	render(C_GREEN, "touch v12: done, rebooting");
+	render(C_GREEN, "touch v13: done, rebooting");
+	draw_pts();
 	flush_log();
 	delay_ms(20000);
 }

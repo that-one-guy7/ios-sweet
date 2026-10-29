@@ -1,11 +1,13 @@
 # Mi 8 (dipper, SDM845) bring-up
 
-**Touch probe (shim v12: both rails + FTS):** v11 on a real phone: the FTS protocol works end to end. After `A0 00 FF` the chip
-echoed `43 01 A0 00 FF` (status event, echo of the scan-mode command) and the irq line fell once; no touch event (0x13/0x23/0x33)
-followed. v9-v11 had dropped the pm8998_l28 (avdd) vote because the chip already ACKed in v8, but I2C runs on vdd alone while
-touch sensing is analog and needs avdd. v12 votes l28 again (RPMh, `RAIL rc=0`) after enabling gpio23 (vdd), then resets the
-chip and runs the same scan-mode attempts and raw event reads as v11. Expect `EVT` lines starting `13`/`23`/`33` and `XY`
-changing while you touch the screen.
+**Touch probe (shim v13: guided touch test):** v12 on a real phone (both rails on, `RAIL rc=0`): the chip streams ~180 events/s
+(events=0x2328 in ~50 s, irq low on every poll, `ST86 bad=0`). The stream alternates two records, `23 11 5D E3 54 00 00 1E` and
+`23 01 D0 63 54 00 00 1D`; by the ST fts5 layout (id 0x23 = motion, x = (b3&0xf)<<8|b2, y = b4<<4|b3>>4) they are points
+(861,1358) and (976,1350) with z = 0, and only the last byte (1C..1F) changes. The owner reported touching changed nothing, so
+it is unclear whether this is touch data. v13 runs four timed windows with on-screen instructions (A no touch, B top-left
+corner, C bottom-right corner, D slow drag) and shows per window `WINn n= zmax=`, `x0= x1=`, `y0= y1=` (count, max byte 5,
+min/max x and y); markers (white = newest decoded point, yellow = previous) are drawn at the decoded x,y, unscaled. Follow the
+instructions printed on the screen.
 
 **Boot 1 result (2026-10-25):** kernel text on screen up to `zone_init`, then frozen on both images. Cause found in the
 patches: the boot-CPU driver (0018) and AppleKeyStore (0038) match `IONameMatch qcom,kryo470`, and mkadt had replaced it
