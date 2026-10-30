@@ -909,33 +909,108 @@ static void win_event(int w, const uint8_t *e)
 	pt_next ^= 1;
 }
 
+/* ST fts_interrupt_handler(): read one event with FIFO_CMD_READALL (0x86); byte 7 & 0x1f = events still queued; read those
+ * with a second 0x86 of 8*remaining bytes. Returns the number of events in buf (8 bytes each, up to 32), 0 if empty,
+ * 0xffffffff if the first transfer failed. *rem_out = events that were queued behind the first one. */
+static unsigned fts_read_fifo(uint8_t *buf, unsigned *rem_out)
+{
+	uint8_t cmd = 0x86;
+	unsigned n = 1, rem;
+
+	if (bb_xfer(FTS_ADDR, &cmd, 1, buf, 8))
+		return 0xffffffffU;
+	*rem_out = 0;
+	if (!buf[0])
+		return 0;
+	rem = buf[7] & 0x1fU;
+	if (rem > 31)
+		rem = 31;
+	*rem_out = rem;
+	if (rem) {
+		if (bb_xfer(FTS_ADDR, &cmd, 1, buf + 8, 8 * rem))
+			return n;
+		n += rem;
+	}
+	return n;
+}
+
+static uint8_t fifo_buf[256];
+static unsigned rem_max, rem_last, stat_n;
+static int stat_i = -1;
+
+static void note_status(const uint8_t *e)
+{
+	stat_n++;
+	if (stat_i >= 0) {
+		L[stat_i].av = le32(e);
+		L[stat_i].bv = le32(e + 4);
+		L[stat_i + 1].av = stat_n;
+	}
+}
+
+/* run for ms milliseconds; count touch-type events (0x13/0x23/0x33) and note status events; returns the count */
+static unsigned count_touch_events(unsigned ms)
+{
+	unsigned total = 0;
+
+	for (unsigned t = 0; t < ms / 20U; t++) {
+		if (!line_get(31)) {
+			unsigned rem = 0, n = fts_read_fifo(fifo_buf, &rem);
+
+			if (n != 0xffffffffU) {
+				rem_last = rem;
+				if (rem > rem_max)
+					rem_max = rem;
+				for (unsigned k = 0; k < n; k++) {
+					uint8_t id = fifo_buf[8 * k];
+
+					if (id == 0x13 || id == 0x23 || id == 0x33)
+						total++;
+					else if (id == 0x43)
+						note_status(fifo_buf + 8 * k);
+				}
+			}
+		}
+		delay_ms(20);
+	}
+	return total;
+}
+
 /* one timed window: poll like before (0x86 x 32 bytes while the irq line is low, else 0x85 every 200 ms) */
 static void run_window(int w, const char *title, unsigned seconds, unsigned *irq_low, unsigned *polls, unsigned *events)
 {
-	uint8_t cmd, big[32], one[8];
+	uint8_t cmd, one[8];
 
 	for (unsigned t = 0; t < seconds * 50U; t++) {
 		int pending = !line_get(31);
 
 		if (pending) {
+			unsigned rem = 0, n;
+
 			(*irq_low)++;
-			cmd = 0x86;
-			memset_b(big, 0, sizeof(big));
 			(*polls)++;
-			if (bb_xfer(FTS_ADDR, &cmd, 1, big, 32)) {
+			n = fts_read_fifo(fifo_buf, &rem);
+			if (n == 0xffffffffU) {
 				bad86++;
 			} else {
 				ok86++;
-				L[raw_i].av = le32(big);	L[raw_i].bv = le32(big + 4);
-				L[raw_i + 1].av = le32(big + 8);	L[raw_i + 1].bv = le32(big + 12);
-				for (unsigned k = 0; k < 4; k++) {
-					if (big[8 * k]) {
-						nz86++;
-						(*events)++;
-						fts_show_event(big + 8 * k, *events);
-						if (big[8 * k] == 0x13 || big[8 * k] == 0x23 || big[8 * k] == 0x33)
-							win_event(w, big + 8 * k);
-					}
+				rem_last = rem;
+				if (rem > rem_max)
+					rem_max = rem;
+				L[raw_i].av = le32(fifo_buf);	L[raw_i].bv = le32(fifo_buf + 4);
+				L[raw_i + 1].av = le32(fifo_buf + 8);	L[raw_i + 1].bv = le32(fifo_buf + 12);
+				for (unsigned k = 0; k < n; k++) {
+					const uint8_t *e = fifo_buf + 8 * k;
+
+					if (!e[0])
+						continue;
+					nz86++;
+					(*events)++;
+					fts_show_event(e, *events);
+					if (e[0] == 0x13 || e[0] == 0x23 || e[0] == 0x33)
+						win_event(w, e);
+					else if (e[0] == 0x43)
+						note_status(e);
 				}
 			}
 			if (line_get(31))
@@ -977,10 +1052,11 @@ void mi8_touch_probe(void)
 
 	nl = 0;
 	tick_i = -1;
-	ev_i = xy_i = st_i = win_i = -1;
+	ev_i = xy_i = st_i = win_i = stat_i = -1;
+	rem_max = rem_last = stat_n = 0;
 	pt_next = pt_valid = 0;
 	ok85 = bad85 = ok86 = bad86 = nz85 = nz86 = hi_after = 0;
-	msg("TOUCH", "mi8 touch v13: guided touch test");
+	msg("TOUCH", "mi8 touch v14: flush + force cal");
 	pair("PIN", 1, "cfg=", rd32(pin_cfg(31)), "io=", rd32(pin_cfg(31) + 4));
 	/* Both touch rails, as Android does (DT: fts vdd = disp_vddio_vreg on gpio23, avdd = pm8998_l28 3.3 V via RPMh).
 	 * v9-v11 skipped the avdd vote on the wrong assumption "the chip ACKs, so avdd is on": the digital side answers on vdd
@@ -1045,6 +1121,38 @@ void mi8_touch_probe(void)
 	cmd_scan[0] = 0xa0; cmd_scan[1] = 0x00; cmd_scan[2] = 0xff;
 	rc = bb_xfer(FTS_ADDR, cmd_scan, 3, 0, 0);
 	pair("SCANCMD", -1, "rc=", (uint32_t)rc, 0, 0);
+	stat_i = nl;
+	pair("STAT", -1, "b0-3=", 0, "b4-7=", 0);
+	pair(" ", -1, "n=", 0, "remmax=", 0);
+	/* v13 on a real phone: byte 7 of every event (0x1c..0x1f) is the ST "events remaining in the FIFO" count, so the FIFO was
+	 * saturated by constant records for three fixed points at z = 0 (touch ids 0, 1 and 2) in every window, touched or not.
+	 * Stock flow here: flush the FIFO (A4 00 01), wait for the panel to be untouched, force calibration (A4 02 <mask>;
+	 * the stock log shows "Mutual negative detect Force cal" right after Sense ON). CAL0 counts touch events in a hands-off
+	 * period BEFORE the force calibration, CAL1 AFTER it. If CAL1 is far below CAL0 the ghosts were a bad baseline. */
+	delay_ms(200);
+	{
+		uint8_t flush[3], fcal[3];
+		unsigned c0, c1;
+
+		flush[0] = 0xa4; flush[1] = 0x00; flush[2] = 0x01;
+		rc = bb_xfer(FTS_ADDR, flush, 3, 0, 0);
+		pair("FLUSH", -1, "rc=", (uint32_t)rc, 0, 0);
+		render(C_RED, "HANDS OFF THE SCREEN (counting)");
+		c0 = count_touch_events(6000);
+		pair("CAL0", -1, "n=", c0, "remmax=", rem_max);
+		fcal[0] = 0xa4; fcal[1] = 0x02; fcal[2] = 0x05;	/* force cal, mutual-sense touch + self-sense touch */
+		rc = bb_xfer(FTS_ADDR, fcal, 3, 0, 0);
+		pair("FCAL", -1, "rc=", (uint32_t)rc, 0, 0);
+		render(C_RED, "HANDS OFF: force calibration");
+		delay_ms(1500);
+		rc = bb_xfer(FTS_ADDR, flush, 3, 0, 0);
+		rem_max = 0;
+		c1 = count_touch_events(6000);
+		pair("CAL1", -1, "n=", c1, "remmax=", rem_max);
+		render(C_BLUE, "calibration done");
+		flush_log();
+		delay_ms(1500);
+	}
 	win_i = nl;
 	for (int k = 0; k < 4; k++) {
 		pair("WIN", k, "n=", 0, "zmax=", 0);
@@ -1057,7 +1165,7 @@ void mi8_touch_probe(void)
 	run_window(2, "C: TOUCH BOTTOM-RIGHT CORNER ONLY", 12, &irq_low, &polls, &events);
 	run_window(3, "D: DRAG ONE FINGER SLOWLY DOWN", 12, &irq_low, &polls, &events);
 	st_update(irq_low, polls);
-	render(C_GREEN, "touch v13: done, rebooting");
+	render(C_GREEN, "touch v14: done, rebooting");
 	draw_pts();
 	flush_log();
 	delay_ms(20000);

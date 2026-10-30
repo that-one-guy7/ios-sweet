@@ -1,13 +1,16 @@
 # Mi 8 (dipper, SDM845) bring-up
 
-**Touch probe (shim v13: guided touch test):** v12 on a real phone (both rails on, `RAIL rc=0`): the chip streams ~180 events/s
-(events=0x2328 in ~50 s, irq low on every poll, `ST86 bad=0`). The stream alternates two records, `23 11 5D E3 54 00 00 1E` and
-`23 01 D0 63 54 00 00 1D`; by the ST fts5 layout (id 0x23 = motion, x = (b3&0xf)<<8|b2, y = b4<<4|b3>>4) they are points
-(861,1358) and (976,1350) with z = 0, and only the last byte (1C..1F) changes. The owner reported touching changed nothing, so
-it is unclear whether this is touch data. v13 runs four timed windows with on-screen instructions (A no touch, B top-left
-corner, C bottom-right corner, D slow drag) and shows per window `WINn n= zmax=`, `x0= x1=`, `y0= y1=` (count, max byte 5,
-min/max x and y); markers (white = newest decoded point, yellow = previous) are drawn at the decoded x,y, unscaled. Follow the
-instructions printed on the screen.
+**Touch probe (shim v14: flush + force calibration):** v13 on a real phone: the three decoded points were the same in the no-touch
+window and the touch windows (x 0x35e..0x3d2, y 0x54e..0x62b), z = 0 throughout. ST's driver source (fts.c from the Pixel 3
+fts_touch tree, uploaded by the owner) explains the rest: byte 7 & 0x1f of every event is the number of events still queued
+(here 0x1c..0x1f, so the FIFO was saturated), touch type = b1 & 0xf (finger = 1) and touch id = b1 >> 4 (0, 1, 2 here: three
+touches), position as in my decode; Sense ON is exactly `A0 00 FF` (matches the chip's echo `43 01 A0 00 FF`). The stock Mi 8 log
+shows the ROM driver reloading firmware 0x51 + config 0x21 on every boot (the chip itself says 0x54 / 0x24, CX VER FFFF) and the
+chip reporting `Mutual negative detect Force cal` right after Sense ON. v14 reads the FIFO the stock way (first 0x86 of 8 bytes,
+then 8 x remaining bytes), flushes it (`A4 00 01`, SPECIAL_FIFO_FLUSH), counts touch events in a 6 s hands-off period (`CAL0`),
+sends a force calibration (`A4 02 05`: SYS_CMD_FORCE_CAL, mutual + self touch), counts again (`CAL1`), then runs the four guided
+windows. `STAT` shows the last status event (0x43 ..., e.g. the echoes) and how many were seen; `remmax` is the largest FIFO
+backlog. Keep your hands OFF the screen while it is red.
 
 **Boot 1 result (2026-10-25):** kernel text on screen up to `zone_init`, then frozen on both images. Cause found in the
 patches: the boot-CPU driver (0018) and AppleKeyStore (0038) match `IONameMatch qcom,kryo470`, and mkadt had replaced it

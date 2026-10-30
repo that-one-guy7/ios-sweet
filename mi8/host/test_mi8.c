@@ -85,7 +85,7 @@ static uint32_t pcfg[160], pout[160];
 enum { S_IDLE, S_ADDR, S_ACKA, S_WR, S_ACKW, S_RD, S_MACK, S_IGN };
 static int st = S_IDLE, bits, rw, slave_low, regptr = -1, rdi, expect_reg, mack, ncmd, cmd0, ev_calls, sense_on;
 static unsigned char evbuf[8];
-static int queued;
+static int queued, ghost_on = 1, cmdb[8];
 static unsigned shift;
 static int last_sda = 1, last_scl = 1;
 
@@ -103,12 +103,17 @@ static void prep_read(void)
 	memset(evbuf, 0, sizeof(evbuf));
 	if (cmd0 == 0x85 || cmd0 == 0x86) {
 		ev_calls++;
-		if (sense_on && (ev_calls % 7) == 0) queued = 3;
-		if (ev_calls == 1) { evbuf[0] = 0x03; evbuf[1] = 0x01; }	/* controller ready */
-		if (sense_on && queued > 0) { queued--;					/* a touch at x=0x123 y=0x456, only once sensing was enabled */
+		if (ev_calls == 1) {							/* controller ready after reset */
+			evbuf[0] = 0x03; evbuf[1] = 0x01;
+		} else if (sense_on && ghost_on) {						/* ghost record, FIFO "remaining" = 3 */
+			unsigned char g[8] = { 0x23, 0x11, 0x5D, 0xE3, 0x54, 0x00, 0x00, 0x03 };
+			memcpy(evbuf, g, 8);
+		} else if (sense_on && queued > 0) {					/* a real touch at x=0x123 y=0x456 */
 			unsigned char t[8] = { 0x13, 0x01, 0x23, 0x61, 0x45, 0x10, 0, 0 };
 			memcpy(evbuf, t, 8);
+			queued--;
 		}
+		if (sense_on && !ghost_on && (ev_calls % 9) == 0) queued = 3;
 	}
 }
 
@@ -120,6 +125,10 @@ static void slave_step(void)
 	else if (scl && last_scl && !last_sda && sda) {
 		if ((st == S_WR || st == S_ACKW) && ncmd == 3 && cmd0 == 0xA0) sense_on = 1;	/* scan mode command */
 		if ((st == S_WR || st == S_ACKW) && ncmd == 1 && cmd0 == 0x93) sense_on = 1;
+		if ((st == S_WR || st == S_ACKW) && ncmd == 3 && cmd0 == 0xA4) {
+			if (cmdb[1] == 0x00 && cmdb[2] == 0x01) queued = 0;			/* FIFO flush */
+			if (cmdb[1] == 0x02) { ghost_on = 0; queued = 0; }			/* force calibration clears the ghosts */
+		}
 		st = S_IDLE; slave_low = 0;
 	}				/* STOP */
 	else if (scl && !last_scl) {										/* rising */
@@ -133,8 +142,8 @@ static void slave_step(void)
 			slave_low = 0;
 			if (rw) { st = S_RD; bits = 0; rdi = 0; prep_read(); slave_low = !(rdbyte() & 0x80); } else { st = S_WR; bits = 0; shift = 0; }
 		} else if (st == S_WR && bits == 8) {
-			if (expect_reg) { regptr = (int)shift; expect_reg = 0; ncmd = 0; cmd0 = (int)shift; ncmd = 1; }
-			else if (ncmd < 8) ncmd++;
+			if (expect_reg) { regptr = (int)shift; expect_reg = 0; cmd0 = (int)shift; cmdb[0] = cmd0; ncmd = 1; }
+			else if (ncmd < 8) { cmdb[ncmd] = (int)shift; ncmd++; }
 			st = S_ACKW; slave_low = 1;
 		} else if (st == S_ACKW) { slave_low = 0; st = S_WR; bits = 0; shift = 0; }
 		else if (st == S_RD) {
@@ -161,7 +170,7 @@ uint32_t rd32(uintptr_t a)
 		if (off == 0) return pcfg[pin];
 		if (off == 4) {
 			unsigned in = (pcfg[pin] & 0x200) ? (pout[pin] & 1) : 1;
-			if (pin == 31) in = (sense_on && queued > 0) ? 0 : 1;	/* irq low while events are queued */
+			if (pin == 31) in = (sense_on && (ghost_on || queued > 0)) ? 0 : 1;	/* irq low while events are queued */
 			if (pin == 33) in = (unsigned)line_sda();
 			if (pin == 34) in = (unsigned)line_scl();
 			return in | (pout[pin] << 1);
@@ -224,7 +233,7 @@ int main(void)
 	mi8_touch_probe();
 	if (getenv("DEBUG_DUMP")) { uint32_t sz; memcpy(&sz, ram[0] + 8, 4); fwrite(ram[0] + 12, 1, sz, stdout); }
 	rh_fake_init();
-	bad += check_zone(ram[0], "TOUCH mi8 touch v13: guided touch test");
+	bad += check_zone(ram[0], "TOUCH mi8 touch v14: flush + force cal");
 	bad += check_zone(ram[0], "V23 hi=00000001 lo=00000000");
 	bad += check_zone(ram[0], "VDDIO1 ok=00000001");
 	bad += check_zone(ram[0], "RAIL rc=00000000");
@@ -237,6 +246,15 @@ int main(void)
 	bad += check_zone(ram[0], "EVT0 b0-3=61230113 b4-7=00001045");
 	bad += check_zone(ram[0], "XY x=00000123 y=00000456");
 	bad += check_zone(ram[0], "SCANCMD rc=00000000");
+	bad += check_zone(ram[0], "FLUSH rc=00000000");
+	bad += check_zone(ram[0], "FCAL rc=00000000");
+	{ /* ghosts before force cal, (almost) none after it */
+		uint32_t sz; memcpy(&sz, ram[0] + 8, 4);
+		char *txt = malloc(sz + 1); memcpy(txt, ram[0] + 12, sz); txt[sz] = 0;
+		unsigned c0 = 0, c1 = 0; char *p0 = strstr(txt, "CAL0 n="), *p1 = strstr(txt, "CAL1 n=");
+		if (!p0 || !p1 || sscanf(p0, "CAL0 n=%x", &c0) != 1 || sscanf(p1, "CAL1 n=%x", &c1) != 1 || !(c0 > 20 && c1 < c0 / 4)) { printf("CAL0=%u CAL1=%u\n", c0, c1); bad++; }
+		free(txt);
+	}
 	bad += check_zone(ram[0], "WIN1 n=");
 	if (fake_fb[1110 * 1080 + 291] != 0xffffffffU) { printf("marker missing at x=291 y=1110: %08x\n", fake_fb[1110 * 1080 + 291]); bad++; }
 	bad += check_zone(ram[0], "RAW86 b0-3=");

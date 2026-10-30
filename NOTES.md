@@ -532,3 +532,12 @@ What it took today (in order): 0058 HID services (Apple IOHIDFamily-1915 user cl
 - avdd vote restored (`RAIL rc=0`): the chip now streams events constantly (0x2328 events in ~50 s, ST86 ok=0x8ca bad=0, irq low on
   every poll). Records: `23 11 5D E3 54 00 00 1E` and `23 01 D0 63 54 00 00 1D` alternating; fts5 decode: (861,1358) type 1 and
   (976,1350) type 0, z=0, last byte 0x1c-0x1f. Fixed x/y while "touching" => v13 guided windows + markers to tell touch from noise.
+
+### Mi 8 touch v13 result (2026-10-29) and what ST's fts.c says
+
+- Window A (no touch) and B (top-left) both show n ~ 2000-2400 touch events with identical x/y ranges: the stream is not the finger.
+  Events: `23 11 BD B3 62 00 00 1C`, `23 01 D2 B3 56 .. 1D`, `23 21 5E E3 54 .. 1E`: ids 1/0/2 (b1>>4), type finger (b1&0xf), z=0, b7&0x1f = FIFO
+  count 28-31 (saturated).
+- ST fts.c (Pixel 3 tree): events_remaining = b7 & 0x1f; Sense ON = A0 00 FF; flush = A4 00 01; force cal = A4 02 <CAL_* mask>; the
+  stock flow also runs flashProcedure/initialization (Mi 8 log: ROM loads fw 0x51 + config 0x21 each boot, ~5 s). The flash/RAM load
+  code (ftsFlash.c) and the Mi 8 vendor driver are still unread.
