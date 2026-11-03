@@ -976,6 +976,236 @@ static unsigned count_touch_events(unsigned ms)
 	return total;
 }
 
+#ifdef MI8_FTS_FW
+/* ---- ST FTM5 firmware burn (port of fts_lib/ftsFlash.c: flash_burn / fillFlash, Google fts_touch tree) ----
+ * The stock Mi 8 log shows the ROM driver doing this on every boot (about 5 s: "load program DONE!", "load config DONE!"):
+ * the chip comes up with FW 0x54 / config 0x24 and the driver burns the ROM's st_fts_e1.ftb (FW 0x51, config 0x21, sec0 94376
+ * bytes, sec1 2656 bytes, no CX). Without it the chip reports ghost touches. The file is embedded at build time
+ * (mi8/fw/st_fts_e1.ftb, see mi8/README.md). Same sequence as ST's library, keep_cx = 1 (panel init + CX pages are not
+ * erased: the stock log shows CX VER FFFF both before and after, nothing to lose). FLASH_CHUNK is 32 KB (ST uses 32 or 64 KB per
+ * DMA round depending on the part; smaller is always valid). If anything fails the stock driver simply burns again at the next
+ * Android boot, which it already does on every boot. */
+extern const uint8_t fts_fw_start[], fts_fw_end[];
+
+#define FLASH_CHUNK	(32U * 1024U)
+#define DMA_CHUNK	32U
+#define FLASH_RETRY	200U
+#define FLASH_WAIT_MS	50U
+
+struct ftsfw {
+	uint32_t fw_ver, cfg_ver, sec0, sec1, sec2, sec3, code_addr, cfg_addr;
+	const uint8_t *data;
+};
+
+static int bn_i = -1;
+
+static void bn_step(uint32_t step, uint32_t a, uint32_t b, const char *title)
+{
+	if (bn_i >= 0) {
+		L[bn_i].av = step;
+		L[bn_i].bv = a;
+		L[bn_i + 1].av = b;
+	}
+	render(C_RED, title);
+	flush_log();
+}
+
+/* parseBinFile(): 0 ok, else the failing check */
+static int fts_parse(const uint8_t *f, uint32_t size, struct ftsfw *o)
+{
+	uint32_t dim, pg_code, pg_panel, pg_cx, pg_cfg;
+
+	o->fw_ver = o->cfg_ver = 0;
+	o->sec0 = o->sec1 = o->sec2 = o->sec3 = 0;
+	o->code_addr = o->cfg_addr = 0;
+	o->data = 0;
+	if (size < 68)
+		return 1;
+	if (le32(f) != 0xAA55AA55U)
+		return 2;
+	if (le32(f + 4) != 1U)
+		return 3;
+	if (f[8] != 0x36 || f[9] != 0x39)	/* DCHIP_ID_0/1 for FTM5 */
+		return 4;
+	o->fw_ver = le32(f + 16);
+	o->cfg_ver = le32(f + 24);
+	o->sec0 = le32(f + 44);
+	o->sec1 = le32(f + 48);
+	o->sec2 = le32(f + 52);
+	o->sec3 = le32(f + 56);
+	dim = o->sec0 + o->sec1 + o->sec2 + o->sec3;
+	if (dim + 64U + 4U != size || size < 284)
+		return 5;
+	o->data = f + 64;
+	pg_code = f[280];
+	pg_panel = f[281];
+	pg_cx = f[282];
+	pg_cfg = f[283];
+	o->code_addr = 0x00000000U;
+	if (!pg_code || !pg_panel || !pg_cx || !pg_cfg) {
+		o->cfg_addr = 0x00007C00U;
+	} else {
+		o->cfg_addr = ((pg_code + pg_panel + pg_cx) * 4096U) / 4U;
+	}
+	return 0;
+}
+
+static int fts_w6(uint8_t a, uint8_t d)
+{
+	uint8_t b[6];
+
+	b[0] = 0xfa; b[1] = 0x20; b[2] = 0x00; b[3] = 0x00; b[4] = a; b[5] = d;
+	return bb_xfer(FTS_ADDR, b, 6, 0, 0);
+}
+
+/* 0 ready, 1 timeout/bus error */
+static int fts_wait_flash(uint8_t type)
+{
+	uint8_t cmd[5], rd[2];
+
+	cmd[0] = 0xfa; cmd[1] = 0x20; cmd[2] = 0x00; cmd[3] = 0x00; cmd[4] = type;
+	for (unsigned i = 0; i < FLASH_RETRY; i++) {
+		rd[0] = 0x80;
+		if (!bb_xfer(FTS_ADDR, cmd, 5, rd, 2) && !(rd[0] & 0x80))
+			return 0;
+		delay_ms(FLASH_WAIT_MS);
+	}
+	return 1;
+}
+
+static int fts_dma_start(void)
+{
+	static const uint8_t cmd[12] = { 0xfa, 0x20, 0x00, 0x00, 0x6b, 0x00, 0x40, 0x42, 0x0f, 0x00, 0x00, 0xc0 };
+
+	if (bb_xfer(FTS_ADDR, cmd, 12, 0, 0))
+		return 1;
+	return fts_wait_flash(0x71);
+}
+
+/* fillFlash(): stage 32-byte pieces in RAM at 0x00100000, then DMA them into flash at `address` (word address) */
+static int fts_fill(uint32_t address, const uint8_t *data, uint32_t size, uint32_t *done_total, uint32_t total)
+{
+	uint32_t remaining = size, wheel = 0;
+	uint8_t buf[5 + DMA_CHUNK], cfg[12];
+
+	while (remaining > 0) {
+		uint32_t block = 0, addr = 0x00100000U, words, a;
+
+		while (block < FLASH_CHUNK && remaining > 0) {
+			uint32_t n = remaining >= DMA_CHUNK ? DMA_CHUNK : remaining;
+
+			if (block + n > FLASH_CHUNK)
+				n = FLASH_CHUNK - block;
+			buf[0] = 0xfa;
+			buf[1] = (uint8_t)(addr >> 24); buf[2] = (uint8_t)(addr >> 16);
+			buf[3] = (uint8_t)(addr >> 8); buf[4] = (uint8_t)addr;
+			for (uint32_t i = 0; i < n; i++)
+				buf[5 + i] = data[i];
+			if (bb_xfer(FTS_ADDR, buf, 5 + n, 0, 0))
+				return 1;
+			addr += n;
+			data += n;
+			remaining -= n;
+			block += n;
+		}
+		words = block / 4U - 1U;
+		a = address + (wheel * FLASH_CHUNK) / 4U;
+		cfg[0] = 0xfa; cfg[1] = 0x20; cfg[2] = 0x00; cfg[3] = 0x00; cfg[4] = 0x72; cfg[5] = 0x00; cfg[6] = 0x00;
+		cfg[7] = (uint8_t)a; cfg[8] = (uint8_t)(a >> 8);
+		cfg[9] = (uint8_t)words; cfg[10] = (uint8_t)(words >> 8);
+		cfg[11] = 0x00;
+		if (bb_xfer(FTS_ADDR, cfg, 12, 0, 0))
+			return 2;
+		if (fts_dma_start())
+			return 3;
+		*done_total += block;
+		wheel++;
+		bn_step(7, *done_total, total, "BURNING TOUCH FIRMWARE - DO NOT POWER OFF");
+	}
+	return 0;
+}
+
+/* fts_system_reset(): HW reg 0x20000024 <- 0x81, then wait up to 1.5 s for the controller-ready event (0x03).
+ * No event is not an error (no firmware running), like the stock code. Returns 1 if the event was seen. */
+static int fts_sys_reset(void)
+{
+	static const uint8_t rst[6] = { 0xfa, 0x20, 0x00, 0x00, 0x24, 0x81 };
+	uint8_t cmd = 0x86, ev[8];
+
+	if (bb_xfer(FTS_ADDR, rst, 6, 0, 0))
+		return -1;
+	for (unsigned t = 0; t < 75; t++) {
+		delay_ms(20);
+		memset_b(ev, 0, sizeof(ev));
+		if (!bb_xfer(FTS_ADDR, &cmd, 1, ev, 8) && ev[0] == 0x03)
+			return 1;
+	}
+	return 0;
+}
+
+/* erase page by page, SKIP_PANEL_CX_INIT: the panel-init and CX pages stay (page numbers from the file's organisation
+ * bytes at 280..283, or the defaults 26-27 and 28-30), everything else is erased */
+static int fts_erase(const uint8_t *f)
+{
+	uint8_t mask[4] = { 0, 0, 0, 0 }, cmd2[9], cmd1[6], cmd[6];
+	unsigned panel_s = 26, panel_e = 27, cx_s = 28, cx_e = 30;
+
+	if (f[280] && f[281] && f[282] && f[283]) {
+		panel_s = f[280];
+		panel_e = f[281] > 1 ? panel_s + f[281] - 1U : panel_s;
+		cx_s = panel_e + 1;
+		cx_e = f[282] > 1 ? cx_s + f[282] - 1U : cx_s;
+	}
+	for (unsigned i = cx_s; i <= cx_e; i++)
+		mask[i / 8] |= (uint8_t)(1U << (i % 8));
+	for (unsigned i = panel_s; i <= panel_e; i++)
+		mask[i / 8] |= (uint8_t)(1U << (i % 8));
+	cmd2[0] = 0xfa; cmd2[1] = 0x20; cmd2[2] = 0x00; cmd2[3] = 0x01; cmd2[4] = 0x28;
+	for (unsigned i = 0; i < 4; i++)
+		cmd2[5 + i] = (uint8_t)(0xffU & ~mask[i]);
+	cmd1[0] = 0xfa; cmd1[1] = 0x20; cmd1[2] = 0x00; cmd1[3] = 0x00; cmd1[4] = 0x6b; cmd1[5] = 0x00;
+	cmd[0] = 0xfa; cmd[1] = 0x20; cmd[2] = 0x00; cmd[3] = 0x00; cmd[4] = 0x6a; cmd[5] = 0xa0;
+	if (bb_xfer(FTS_ADDR, cmd2, 9, 0, 0) || bb_xfer(FTS_ADDR, cmd1, 6, 0, 0) || bb_xfer(FTS_ADDR, cmd, 6, 0, 0))
+		return 1;
+	return fts_wait_flash(0x6a);
+}
+
+/* flash_burn() steps 1-9. 0 ok, else 10 * step + detail */
+static int fts_burn(const struct ftsfw *fw, const uint8_t *file)
+{
+	uint32_t done = 0, total = fw->sec0 + fw->sec1;
+	static const uint8_t hold[6] = { 0xfa, 0x20, 0x00, 0x00, 0x24, 0x01 };
+	int rc;
+
+	bn_step(1, 0, total, "BURNING TOUCH FIRMWARE - DO NOT POWER OFF");
+	if (fts_sys_reset() < 0)
+		return 10;
+	delay_ms(100);
+	bn_step(2, 0, total, "BURNING TOUCH FIRMWARE - DO NOT POWER OFF");
+	if (bb_xfer(FTS_ADDR, hold, 6, 0, 0))
+		return 20;
+	if (fts_w6(0x1b, 0x66) || fts_w6(0x68, 0x13))	/* UVLO + auto power down */
+		return 30;
+	if (fts_w6(0x25, 0x20) || fts_w6(0x6b, 0x00))	/* flash unlock */
+		return 40;
+	if (fts_w6(0xde, 0x03))				/* erase unlock */
+		return 50;
+	bn_step(6, 0, total, "BURNING TOUCH FIRMWARE - ERASING");
+	if (fts_erase(file))
+		return 60;
+	rc = fts_fill(fw->code_addr, fw->data, fw->sec0, &done, total);	/* 7) program */
+	if (rc)
+		return 70 + rc;
+	rc = fts_fill(fw->cfg_addr, fw->data + fw->sec0, fw->sec1, &done, total);	/* 8) config */
+	if (rc)
+		return 80 + rc;
+	bn_step(9, done, total, "BURNING TOUCH FIRMWARE - RESET");
+	if (fts_sys_reset() < 0)
+		return 90;
+	return 0;
+}
+#endif /* MI8_FTS_FW */
+
 /* one timed window: poll like before (0x86 x 32 bytes while the irq line is low, else 0x85 every 200 ms) */
 static void run_window(int w, const char *title, unsigned seconds, unsigned *irq_low, unsigned *polls, unsigned *events)
 {
@@ -1056,7 +1286,7 @@ void mi8_touch_probe(void)
 	rem_max = rem_last = stat_n = 0;
 	pt_next = pt_valid = 0;
 	ok85 = bad85 = ok86 = bad86 = nz85 = nz86 = hi_after = 0;
-	msg("TOUCH", "mi8 touch v14: flush + force cal");
+	msg("TOUCH", "mi8 touch v15: fw burn + touch");
 	pair("PIN", 1, "cfg=", rd32(pin_cfg(31)), "io=", rd32(pin_cfg(31) + 4));
 	/* Both touch rails, as Android does (DT: fts vdd = disp_vddio_vreg on gpio23, avdd = pm8998_l28 3.3 V via RPMh).
 	 * v9-v11 skipped the avdd vote on the wrong assumption "the chip ACKs, so avdd is on": the digital side answers on vdd
@@ -1093,6 +1323,39 @@ void mi8_touch_probe(void)
 	rc = bb_xfer(FTS_ADDR, w, 1, ev, 8);
 	pair("BOOTEV", -1, "rc=", (uint32_t)rc, "b0-3=", le32(ev));
 	pair(" ", -1, "b4-7=", le32(ev + 4), "irq=", (uint32_t)line_get(31));
+#ifdef MI8_FTS_FW
+	{
+		struct ftsfw fw;
+		uint32_t fsize = (uint32_t)(fts_fw_end - fts_fw_start);
+		int prc = fts_parse(fts_fw_start, fsize, &fw);
+		uint32_t chip_fw = (uint32_t)r[4] | ((uint32_t)r[5] << 8);
+
+		pair("FWFILE", -1, "parse=", (uint32_t)prc, "fw=", fw.fw_ver);
+		pair(" ", -1, "cfg=", fw.cfg_ver, "sec0=", fw.sec0);
+		pair(" ", -1, "sec1=", fw.sec1, "sec2=", fw.sec2);
+		pair("CHIPFW", -1, "fw=", chip_fw, "burn=", (uint32_t)(!prc && fw.fw_ver != chip_fw));
+		flush_log();
+		if (!prc && fw.fw_ver != chip_fw) {
+			int brc;
+
+			bn_i = nl;
+			pair("BURN", -1, "step=", 0, "done=", 0);
+			pair(" ", -1, "total=", fw.sec0 + fw.sec1, 0, 0);
+			brc = fts_burn(&fw, fts_fw_start);
+			bn_i = -1;
+			pair("BURNRC", -1, "rc=", (uint32_t)brc, 0, 0);
+			delay_ms(300);
+			memset_b(r, 0, sizeof(r));
+			w[0] = 0xfa; w[1] = 0x20; w[2] = 0x00; w[3] = 0x00; w[4] = 0x00;
+			rc = bb_xfer(FTS_ADDR, w, 5, r, 8);
+			pair("NEWFW", -1, "rc=", (uint32_t)rc, "fw=", (uint32_t)r[4] | ((uint32_t)r[5] << 8));
+			pair(" ", -1, "b0-3=", le32(r), "b4-7=", le32(r + 4));
+			flush_log();
+		}
+	}
+#else
+	pair("FWFILE", -1, "none=", 1, 0, 0);	/* no mi8/fw/st_fts_e1.ftb at build time: the chip keeps its own firmware */
+#endif
 	ev_i = nl;
 	for (int k = 0; k < EV_LINES; k++)
 		pair("EVT", k, "b0-3=", 0, "b4-7=", 0);
@@ -1165,7 +1428,7 @@ void mi8_touch_probe(void)
 	run_window(2, "C: TOUCH BOTTOM-RIGHT CORNER ONLY", 12, &irq_low, &polls, &events);
 	run_window(3, "D: DRAG ONE FINGER SLOWLY DOWN", 12, &irq_low, &polls, &events);
 	st_update(irq_low, polls);
-	render(C_GREEN, "touch v14: done, rebooting");
+	render(C_GREEN, "touch v15: done, rebooting");
 	draw_pts();
 	flush_log();
 	delay_ms(20000);

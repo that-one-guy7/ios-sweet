@@ -541,3 +541,13 @@ What it took today (in order): 0058 HID services (Apple IOHIDFamily-1915 user cl
 - ST fts.c (Pixel 3 tree): events_remaining = b7 & 0x1f; Sense ON = A0 00 FF; flush = A4 00 01; force cal = A4 02 <CAL_* mask>; the
   stock flow also runs flashProcedure/initialization (Mi 8 log: ROM loads fw 0x51 + config 0x21 each boot, ~5 s). The flash/RAM load
   code (ftsFlash.c) and the Mi 8 vendor driver are still unread.
+
+### Mi 8 touch v14 result (2026-10-29) and the burn port
+
+- Ghost persists with the FIFO drained (remaining 0-2): one record `23 01 5E E3 54 00 00 xx` (id 0, finger, x=862 y=1358 z=0), ~155/s in
+  hands-off period (`CAL0 n=0x3a5` in 6 s); v14's CAL1 and window lines were not captured (photo ended at `FCAL rc=0`).
+- ST fts_lib (Google fts_touch tree) `flash_burn` is the 5 s `load program/load config` step in the Mi 8 log (same strings). Constants used:
+  HW reg cmd 0xFA, unlock 0x25<-0x20 and 0x6B<-0x00, erase unlock 0xDE<-0x03, erase 0x6A<-0xA0 (wait on 0x6A bit7), DMA config 0x72, DMA start
+  0x6B 00 40 42 0F 00 00 C0 (wait on 0x71), system reset 0x20000024<-0x81, hold M3 <-0x01, uvlo 0x1B<-0x66, autopowerdown 0x68<-0x13;
+  FLASH_ADDR_CODE 0, config 0x7C00 (or from the organisation bytes at file offset 280..283), DMA_CHUNK 32, FLASH_CHUNK 32 KB here.
+- .ftb header: signature 0xAA55AA55 @0, ftb ver @4, target 36 39 @8, svn @12, fw ver @16, cfg ver @24, sec sizes @44..56, data @64, 4-byte crc at the end.

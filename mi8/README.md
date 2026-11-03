@@ -1,16 +1,19 @@
 # Mi 8 (dipper, SDM845) bring-up
 
-**Touch probe (shim v14: flush + force calibration):** v13 on a real phone: the three decoded points were the same in the no-touch
-window and the touch windows (x 0x35e..0x3d2, y 0x54e..0x62b), z = 0 throughout. ST's driver source (fts.c from the Pixel 3
-fts_touch tree, uploaded by the owner) explains the rest: byte 7 & 0x1f of every event is the number of events still queued
-(here 0x1c..0x1f, so the FIFO was saturated), touch type = b1 & 0xf (finger = 1) and touch id = b1 >> 4 (0, 1, 2 here: three
-touches), position as in my decode; Sense ON is exactly `A0 00 FF` (matches the chip's echo `43 01 A0 00 FF`). The stock Mi 8 log
-shows the ROM driver reloading firmware 0x51 + config 0x21 on every boot (the chip itself says 0x54 / 0x24, CX VER FFFF) and the
-chip reporting `Mutual negative detect Force cal` right after Sense ON. v14 reads the FIFO the stock way (first 0x86 of 8 bytes,
-then 8 x remaining bytes), flushes it (`A4 00 01`, SPECIAL_FIFO_FLUSH), counts touch events in a 6 s hands-off period (`CAL0`),
-sends a force calibration (`A4 02 05`: SYS_CMD_FORCE_CAL, mutual + self touch), counts again (`CAL1`), then runs the four guided
-windows. `STAT` shows the last status event (0x43 ..., e.g. the echoes) and how many were seen; `remmax` is the largest FIFO
-backlog. Keep your hands OFF the screen while it is red.
+**Touch probe (shim v15: firmware burn):** v14 on a real phone: even with nothing touching it the screen "touched" at the right side
+(x ~ 860, y ~ 1358, z = 0, no contact area), also after flush and force calibration, in every earlier version too. ST's library
+explains why the stock Mi 8 ROM burns the touch firmware on every boot (`load program DONE!`, `load config DONE!`, about 5 s: ROM
+file FW 0x51 / config 0x21, 94376 + 2656 bytes, versus the chip's own 0x54 / 0x24): the chip's built-in image is the one producing the
+ghost. v15 ports ST's `flash_burn` (Google fts_touch `fts_lib/ftsFlash.c`: system reset, hold M3, UVLO, flash unlock, erase unlock,
+page-by-page erase that keeps the panel-init and CX pages, 32 KB DMA rounds through RAM at 0x00100000, config, system reset).
+It needs the ROM's file: put it at `mi8/fw/st_fts_e1.ftb` (see `mi8/fw/README.md`; on the phone: `adb pull` from the vendor
+partition in TWRP) and the build embeds it (`-DMI8_FTS_FW`, `shim/ftsfw.S`). Without the file the probe still runs (`FWFILE none=1`).
+Screen lines: `FWFILE parse= fw= cfg= sec0= sec1= sec2=` (parse 0 = the container checks out: signature, chip id 0x36 0x39, sizes),
+`CHIPFW fw= burn=` (the chip's version and whether it will burn), `BURN step= done= total=` (live), `BURNRC rc=` (0 ok, else
+10*step+detail), `NEWFW rc= fw=` (version read back after the burn: expect 0x51). Then the same flush, force calibration and
+guided windows as v14. If the burn fails, nothing is lost: the stock driver burns again at the next Android boot, as it does every boot.
+The host tests (`mi8/host/run_tests.sh`) run the burn against a simulated chip and compare its I2C write stream (2290 transactions
+on the synthetic file) with `ref_burn.py`, an independent re-implementation of ST's procedure.
 
 **Boot 1 result (2026-10-25):** kernel text on screen up to `zone_init`, then frozen on both images. Cause found in the
 patches: the boot-CPU driver (0018) and AppleKeyStore (0038) match `IONameMatch qcom,kryo470`, and mkadt had replaced it

@@ -17,12 +17,22 @@ CFLAGS="-O2 -ffreestanding -nostdlib -fno-pic -mgeneral-regs-only -mstrict-align
 	-Wall -Wextra -DTARGET_MI8 -I$shim"
 if [ "${MI8_RESET:-android}" = bootloader ]; then CFLAGS="$CFLAGS -DMI8_RESET_BOOTLOADER"; fi
 rm -rf "$out"; mkdir -p "$out"
-# Host tests first: shim/mi8.c against a fake MMIO + ramoops, and the console layout.
-gcc -O1 -Wall -Wextra -DMI8_HOST -DTARGET_MI8 -I"$shim" -I"$here/host" -o "$out/test_mi8" "$here/host/test_mi8.c" "$shim/mi8.c"
-"$out/test_mi8"
+# Host tests first: shim/mi8.c against a fake SoC + FTS slave model, and the touch firmware burn against ST's command stream.
+bash "$here/host/run_tests.sh" "$shim" "$out/host"
+# Optional touch firmware (mi8/fw/st_fts_e1.ftb): embedded in the shim, the touch probe burns it if the chip's version differs.
+FTS_OBJ=""
+if [ -f "$here/fw/st_fts_e1.ftb" ]; then
+	cp "$here/fw/st_fts_e1.ftb" "$out/st_fts_e1.ftb"
+	CFLAGS="$CFLAGS -DMI8_FTS_FW"
+	FTS_OBJ="$out/ftsfw.o"
+	echo "touch firmware embedded: $(stat -c %s "$here/fw/st_fts_e1.ftb") bytes"
+else
+	echo "no mi8/fw/st_fts_e1.ftb: building without the touch firmware burn"
+fi
 for f in start.S shim.c console.c mmu.c fdt.c loader.c ufs.c mi8.c; do
 	$CC $CFLAGS -c "$shim/$f" -o "$out/${f%.*}.o"
 done
+if [ -n "$FTS_OBJ" ]; then $CC $CFLAGS -I"$out" -c "$shim/ftsfw.S" -o "$FTS_OBJ"; fi
 # The image runs wherever ABL puts it with no relocation pass, so no object may carry an absolute (ABS64)
 # relocation in a section that ends up in the image. Report every offender, not just a count.
 bad=0
@@ -32,7 +42,7 @@ for o in shim console mmu fdt loader ufs mi8; do
 done
 [ "$bad" = 0 ] || { echo "error: absolute relocations in C objects (see above)" >&2; exit 1; }
 $CC $CFLAGS -static -T "$shim/shim.ld" -Wl,--build-id=none -Wl,--no-warn-rwx-segments -Wl,-N \
-	"$out"/{start,shim,console,mmu,fdt,loader,ufs,mi8}.o -o "$out/shim.elf"
+	"$out"/{start,shim,console,mmu,fdt,loader,ufs,mi8}.o $FTS_OBJ -o "$out/shim.elf"
 $OBJCOPY -O binary "$out/shim.elf" "$out/Image"
 size=$((16#$($NM "$out/shim.elf" | awk '$3=="_end"{print $1}')))
 truncate -s "$size" "$out/Image"
